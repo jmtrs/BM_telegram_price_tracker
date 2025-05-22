@@ -12,7 +12,7 @@ def get_db_connection():
     global conn
     if conn is None or conn.closed:
         try:
-            conn = psycopg2.connect(config.SUPABASE_PG_URI, cursor_factory=RealDictCursor)
+            conn = psycopg2.connect(config.DATABASE_URL, cursor_factory=RealDictCursor)
             conn.autocommit = True # O manejar transacciones explícitamente
             logger.info("Nueva conexión a la base de datos establecida.")
         except psycopg2.Error as e:

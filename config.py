@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-SUPABASE_PG_URI = os.getenv("SUPABASE_PG_URI")
+DATABASE_URL = os.getenv("DATABASE_URL")
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", 14400))
@@ -31,8 +31,8 @@ logger = logging.getLogger(__name__)
 if not TELEGRAM_TOKEN:
     logger.critical("No se encontró TELEGRAM_TOKEN en las variables de entorno.")
     raise ValueError("No se encontró TELEGRAM_TOKEN en las variables de entorno.")
-if not SUPABASE_PG_URI:
-    logger.critical("No se encontró SUPABASE_PG_URI en las variables de entorno.")
-    raise ValueError("No se encontró SUPABASE_PG_URI en las variables de entorno.")
+if not DATABASE_URL:
+    logger.critical("No se encontró DATABASE_URL en las variables de entorno.")
+    raise ValueError("No se encontró DATABASE_URL en las variables de entorno.")
 if not SCRAPERAPI_KEY:
     logger.warning("No se encontró SCRAPERAPI_KEY. El scraping podría no funcionar como se espera.")
