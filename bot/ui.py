@@ -129,7 +129,7 @@ def format_notification_content(alert_data: dict, product_info: dict) -> tuple[s
 HELP_MESSAGE_MARKDOWN = (
     "🤖 *Comandos disponibles:*\n\n"
     "/track `<URL>` `<precio_objetivo>` – Añade o actualiza una alerta.\n"
-    "/alerts – Lista tus alertas y permite actualizarlas o eliminarlas.\n"
+    "/alerts – Lista tus alertas y permite eliminarlas.\n"
     "/delete `<número>` – Elimina una alerta por su número de la lista.\n"
     "/help – Muestra este mensaje."
 )
