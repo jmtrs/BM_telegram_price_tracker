@@ -29,7 +29,7 @@ async def main_async_logic():
     logger.info("Iniciando el bot...")
 
     try:
-        db_conn = await db_connection.get_db_connection()
+        db_conn = db_connection.get_db_connection()
         if db_conn is None or db_conn.closed:
             logger.critical("La conexión a la BD no se pudo establecer o está cerrada después del intento inicial.")
             return
