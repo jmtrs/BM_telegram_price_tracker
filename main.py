@@ -29,8 +29,7 @@ async def main_async_logic():
     logger.info("Iniciando el bot...")
 
     try:
-        db_conn = db_connection.get_db_connection()
-        # Verificar si la conexión se ha establecido correctamente
+        db_conn = await db_connection.get_db_connection()
         if db_conn is None or db_conn.closed:
             logger.critical("La conexión a la BD no se pudo establecer o está cerrada después del intento inicial.")
             return
@@ -67,7 +66,7 @@ async def main_async_logic():
         logger.critical(f"Error no capturado en el bucle principal de polling: {e}", exc_info=True)
     finally:
         logger.info("Iniciando proceso de apagado (desde el bloque finally de main_async_logic)...")
-        
+
         if checker_task and not checker_task.done():
             logger.info("Cancelando la tarea del checker...")
             checker_task.cancel()
@@ -78,7 +77,7 @@ async def main_async_logic():
                 logger.info("Tarea del checker explícitamente cancelada y finalizada.")
             except Exception as e_task:
                 logger.error(f"Error durante la espera de la cancelación de la tarea del checker: {e_task}", exc_info=True)
-        
+
         db_connection.close_db_connection()
         logger.info("🤖 Bot detenido (desde el bloque finally de main_async_logic).")
 

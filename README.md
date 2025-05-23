@@ -42,16 +42,6 @@ This Telegram bot allows users to track product prices from URLs. It periodicall
     ```
 
 3.  **Install dependencies:**
-    Create a `requirements.txt` file with the following content:
-    ```txt
-    python-telegram-bot==20.3
-    psycopg2-binary
-    requests
-    beautifulsoup4
-    python-dotenv
-    nest_asyncio
-    ```
-    Then install them:
     ```bash
     pip install -r requirements.txt
     ```
@@ -76,7 +66,7 @@ The project includes unit tests for URL cleaning and product detail parsing. Mak
 To run the tests:
 
 ```bash
-python -m unittest test_main.py
+pytest tests/
 ```
 
 Ensure that scraper.html (if used by tests for specific scenarios) is present or that tests have appropriate fallbacks.
