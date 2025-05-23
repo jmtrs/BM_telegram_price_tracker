@@ -1,8 +1,7 @@
-# tu_proyecto/scraper/core.py
+# scraper/core.py
 import logging
 import json
 import asyncio
-from datetime import datetime, timedelta
 
 import requests
 from bs4 import BeautifulSoup

@@ -1,4 +1,4 @@
-# tu_proyecto/db/queries.py
+# db/queries.py
 import logging
 from datetime import datetime, timedelta
 from .connection import get_db_connection

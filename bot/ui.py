@@ -1,4 +1,4 @@
-# tu_proyecto/bot/ui.py
+# bot/ui.py
 import logging
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 

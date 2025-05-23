@@ -1,4 +1,4 @@
-# tu_proyecto/config.py
+# config.py
 import os
 import logging
 from dotenv import load_dotenv

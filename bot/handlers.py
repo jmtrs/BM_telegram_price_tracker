@@ -1,4 +1,4 @@
-# tu_proyecto/bot/handlers.py
+# bot/handlers.py
 import logging
 import asyncio
 from telegram import Update, InputMediaPhoto

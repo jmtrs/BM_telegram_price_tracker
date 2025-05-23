@@ -1,4 +1,4 @@
-# tu_proyecto/scraper/utils.py
+# scraper/utils.py
 from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode
 import logging
 

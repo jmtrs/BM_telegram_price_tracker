@@ -1,4 +1,4 @@
-# tu_proyecto/tasks/checker.py
+# tasks/checker.py
 import asyncio
 import logging
 from datetime import datetime, timedelta

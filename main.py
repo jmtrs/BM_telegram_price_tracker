@@ -1,4 +1,4 @@
-# tu_proyecto/main.py
+# main.py
 import nest_asyncio
 nest_asyncio.apply()
 
