@@ -1,5 +1,6 @@
 # main.py
 import nest_asyncio
+
 nest_asyncio.apply()
 
 import asyncio
@@ -12,7 +13,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 # Importar módulos como paquetes desde la raíz del proyecto
 from bot import handlers as bot_handlers
 from tasks import checker as tasks_checker
-from db import connection as db_connection
+from db import connection as db_connection  # db_connection will now refer to the new async pool setup
 
 # Configuración del logger principal de la aplicación
 logging.basicConfig(
@@ -29,13 +30,17 @@ async def main_async_logic():
     logger.info("Iniciando el bot...")
 
     try:
-        db_conn = db_connection.get_db_connection()
-        if db_conn is None or db_conn.closed:
-            logger.critical("La conexión a la BD no se pudo establecer o está cerrada después del intento inicial.")
-            return
-        logger.info("Conexión inicial a la base de datos verificada.")
+        # Initialize the database pool
+        await db_connection.init_db_pool()
+        # Test the pool by acquiring a connection (optional, but good for early failure detection)
+        pool = await db_connection.get_db_pool()
+        async with pool.acquire() as conn:
+            # Example: Perform a simple query to ensure connection works
+            version = await conn.fetchval("SELECT version()")
+            logger.info(f"Conexión inicial a la base de datos verificada. PostgreSQL version: {version}")
+
     except Exception as e:
-        logger.critical(f"Fallo crítico al obtener conexión a la BD en main: {e}", exc_info=True)
+        logger.critical(f"Fallo crítico al inicializar el pool de BD o verificar conexión en main: {e}", exc_info=True)
         return
 
     application = (
@@ -58,7 +63,7 @@ async def main_async_logic():
 
     try:
         logger.info("🤖 Bot iniciado y escuchando actualizaciones...")
-        # run_polling es una llamada bloqueante que maneja su propio ciclo de vida de inicialización/apagado.
+        # Ensure application.run_polling() is awaited as it's an async operation
         await application.run_polling()
     except KeyboardInterrupt:
         logger.info("Cerrando el bot por interrupción de teclado (Ctrl+C)...")
@@ -76,9 +81,11 @@ async def main_async_logic():
             except asyncio.CancelledError:
                 logger.info("Tarea del checker explícitamente cancelada y finalizada.")
             except Exception as e_task:
-                logger.error(f"Error durante la espera de la cancelación de la tarea del checker: {e_task}", exc_info=True)
+                logger.error(f"Error durante la espera de la cancelación de la tarea del checker: {e_task}",
+                             exc_info=True)
 
-        db_connection.close_db_connection()
+        # Close the database pool
+        await db_connection.close_db_pool()
         logger.info("🤖 Bot detenido (desde el bloque finally de main_async_logic).")
 
 

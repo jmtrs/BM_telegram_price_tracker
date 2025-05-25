@@ -25,7 +25,7 @@ LOGGING_HTTPX_LEVEL = getattr(logging, LOGGING_HTTPX_LEVEL_NAME, logging.WARNING
 
 # Configuración básica de logging para este módulo si se importa antes que main
 # main.py puede reconfigurar con un formato más detallado.
-logging.basicConfig(level=LOGGING_LEVEL) # Asegura que el logger esté configurado
+logging.basicConfig(level=LOGGING_LEVEL)  # Asegura que el logger esté configurado
 logger = logging.getLogger(__name__)
 
 if not TELEGRAM_TOKEN:
