@@ -15,6 +15,7 @@ from bot import ui as bot_ui
 
 logger = logging.getLogger(__name__)
 
+
 async def check_alerts_periodically(application: Application):
     bot = application.bot
     while True:
@@ -50,14 +51,15 @@ async def check_alerts_periodically(application: Application):
             if last_notified_utc and now_utc - last_notified_utc < timedelta(hours=config.NOTIFY_COOLDOWN_HOURS):
                 logger.info(f"Saltando alerta ID {alert_data['id']} (cooldown).")
                 continue
-            
-            product_info = await scraper_core.get_product_info(alert_data['full_url'])
+
+            product_info = await scraper_core.get_product_info(alert_data['full_url'], use_api=True)
             current_price = product_info.get("price")
 
             async with pool.acquire() as conn_update:
                 async with conn_update.transaction():
                     if current_price is None:
-                        logger.warning(f"No se pudo obtener precio para alerta ID {alert_data['id']}. Estado: {product_info.get('status')}")
+                        logger.warning(
+                            f"No se pudo obtener precio para alerta ID {alert_data['id']}. Estado: {product_info.get('status')}")
                         await db_queries.update_alert_last_price(conn_update, str(alert_data['id']), None)
                         continue
 
@@ -77,21 +79,29 @@ async def check_alerts_periodically(application: Application):
                             logger.info(f"{log_msg_notif_base} bajó de {previous_last_price}€.")
                         elif current_price == previous_last_price:
                             notification_triggered = True
-                            logger.info(f"{log_msg_notif_base} sigue cumpliendo (igual que anterior), cooldown permite.")
+                            logger.info(
+                                f"{log_msg_notif_base} sigue cumpliendo (igual que anterior), cooldown permite.")
                         else:
                             notification_triggered = True
-                            logger.info(f"{log_msg_notif_base} (subió de {previous_last_price}€) pero sigue en objetivo, cooldown permite.")
+                            logger.info(
+                                f"{log_msg_notif_base} (subió de {previous_last_price}€) pero sigue en objetivo, cooldown permite.")
 
                     if notification_triggered:
-                        alert_data_for_msg = alert_data.copy()
+                        alert_data_for_msg = dict(alert_data).copy()
                         alert_data_for_msg['last_price'] = previous_last_price
 
-                        message_text, inline_keyboard, image_url = bot_ui.format_notification_content(alert_data_for_msg, product_info)
+                        message_text, inline_keyboard, image_url = bot_ui.format_notification_content(
+                            alert_data_for_msg, product_info)
 
                         try:
+                            chat_id_to_notify = alert_data.get('telegram_chat_id')
+                            if not chat_id_to_notify:
+                                logger.error(f"No se puede enviar notificación para alerta ID {alert_data['id']} porque telegram_chat_id es None.")
+                                continue # Saltar al siguiente ciclo de la alerta o manejar de otra forma
+
                             if image_url:
                                 await bot.send_photo(
-                                    chat_id=alert_data['chat_id'],
+                                    chat_id=chat_id_to_notify,
                                     photo=image_url,
                                     caption=message_text,
                                     parse_mode=ParseMode.MARKDOWN,
@@ -99,22 +109,29 @@ async def check_alerts_periodically(application: Application):
                                 )
                             else:
                                 await bot.send_message(
-                                    chat_id=alert_data['chat_id'],
+                                    chat_id=chat_id_to_notify,
                                     text=message_text,
                                     parse_mode=ParseMode.MARKDOWN,
                                     reply_markup=inline_keyboard
                                 )
 
                             await db_queries.update_alert_last_notified(conn_update, str(alert_data['id']))
-                            logger.info(f"Notificación enviada a chat_id {alert_data['chat_id']} por alerta ID {alert_data['id']}.")
+                            logger.info(
+                                f"Notificación enviada a chat_id {chat_id_to_notify} por alerta ID {alert_data['id']}.")
                         except TelegramError as e:
-                            logger.error(f"Error Telegram al enviar notificación a {alert_data['chat_id']} (alerta {alert_data['id']}): {e}")
-                            if "bot was blocked by the user" in str(e).lower() or "chat not found" in str(e).lower():
-                                logger.warning(f"Bot bloqueado o chat no encontrado para {alert_data['chat_id']}. Considerar eliminar/desactivar alertas.")
+                            # El chat_id_to_notify ya fue validado arriba, pero lo mantenemos en el log por consistencia
+                            logger.error(
+                                f"Error Telegram al enviar notificación a {chat_id_to_notify} (alerta {alert_data['id']}): {e}")
+                            if chat_id_to_notify and ("bot was blocked by the user" in str(e).lower() or "chat not found" in str(e).lower()):
+                                logger.warning(
+                                    f"Bot bloqueado o chat no encontrado para {chat_id_to_notify}. Considerar eliminar/desactivar alertas.")
                         except Exception as e:
-                            logger.error(f"Error general al enviar notificación a {alert_data['chat_id']} (alerta {alert_data['id']}): {e}", exc_info=True)
+                            logger.error(
+                                f"Error general al enviar notificación a {chat_id_to_notify if chat_id_to_notify else 'ID de chat desconocido'} (alerta {alert_data['id']}): {e}",
+                                exc_info=True)
                     else:
-                        logger.info(f"Alerta ID {alert_data['id']}: Precio {current_price}€ (Obj:{target_price}€, Prev:{previous_last_price}€). No requiere notificación.")
+                        logger.info(
+                            f"Alerta ID {alert_data['id']}: Precio {current_price}€ (Obj:{target_price}€, Prev:{previous_last_price}€). No requiere notificación.")
 
         try:
             async with pool.acquire() as conn_cleanup:

@@ -25,11 +25,10 @@ CREATE TABLE public.alerts (
     last_price float8 NULL,
     inserted_at timestamp DEFAULT now() NULL,
     CONSTRAINT alerts_pkey PRIMARY KEY (id),
+    CONSTRAINT alerts_user_cleanurl_unique UNIQUE (user_id, clean_url),
     CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE
 );
 
--- A user should only have one alert per clean_url
-CREATE UNIQUE INDEX alerts_user_id_clean_url_idx ON public.alerts (user_id, clean_url);
 -- Index for quickly finding all alerts for a specific user
 CREATE INDEX alerts_user_id_idx ON public.alerts (user_id);
 

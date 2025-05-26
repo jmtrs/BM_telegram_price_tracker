@@ -1,12 +1,13 @@
 # application_core/use_cases/user_use_cases.py
 import logging
 from typing import Optional
-from uuid import uuid4  # For generating new user IDs
+from uuid import uuid4
 
 from application_core.domain_models.user_model import User
 from application_core.ports.user_repository_port import UserRepositoryPort
 
 logger = logging.getLogger(__name__)
+
 
 class GetOrCreateUserByTelegramIdUseCase:
     def __init__(self, user_repository: UserRepositoryPort):
@@ -17,7 +18,6 @@ class GetOrCreateUserByTelegramIdUseCase:
         user = await self.user_repository.get_by_telegram_id(telegram_chat_id)
         if user:
             logger.info(f"User found by telegram_chat_id {telegram_chat_id}: {user.id}")
-            # Optionally update username if it has changed or is now provided
             if username and user.username != username:
                 user.username = username
                 updated_user = await self.user_repository.update(user)
@@ -26,7 +26,7 @@ class GetOrCreateUserByTelegramIdUseCase:
                     return updated_user
                 else:
                     logger.warning(f"Failed to update username for user {user.id}")
-                    return user  # Return original user if update fails
+                    return user
             return user
 
         logger.info(f"User not found by telegram_chat_id {telegram_chat_id}. Creating new user.")
@@ -45,6 +45,7 @@ class GetOrCreateUserByTelegramIdUseCase:
             logger.error(f"Failed to create new user for telegram_chat_id {telegram_chat_id}")
             return None
 
+
 class GetOrCreateUserByIdpIdUseCase:
     def __init__(self, user_repository: UserRepositoryPort):
         self.user_repository = user_repository
@@ -54,7 +55,6 @@ class GetOrCreateUserByIdpIdUseCase:
         user = await self.user_repository.get_by_idp_id(idp_user_id)
         if user:
             logger.info(f"User found by idp_user_id {idp_user_id}: {user.id}")
-            # Optionally update username if it has changed or is now provided
             if username and user.username != username:
                 user.username = username
                 updated_user = await self.user_repository.update(user)

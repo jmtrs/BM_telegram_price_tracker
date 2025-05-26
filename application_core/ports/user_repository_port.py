@@ -24,10 +24,12 @@ class UserRepositoryPort(ABC):
         pass
 
     @abstractmethod
+    async def add_user(self, telegram_chat_id: int | None, idp_user_id: str | None,
+                       username: str | None, is_active: bool) -> Optional[User]:
+        """Create a new user in DB with provided identifiers."""
+        pass
+
+    @abstractmethod
     async def update(self, user: User) -> Optional[User]:
         pass
 
-    # Optional: A method to list users, could be useful for admin purposes
-    # @abstractmethod
-    # async def list_all(self) -> list[User]:
-    # pass

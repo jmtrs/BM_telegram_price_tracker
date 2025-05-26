@@ -1,112 +1,90 @@
 # application_core/use_cases/alert_use_cases.py
 import logging
-from typing import Optional, List, Tuple
+from typing import List, Tuple
 from uuid import UUID
-import asyncpg # For type hinting if returning records directly
+from application_core.domain_models.alert_model import Alert
 
 from ..ports.alert_repository_port import AlertRepositoryPort
 from ..ports.user_repository_port import UserRepositoryPort
-from ..domain_models.user_model import User
-# from ..domain_models.alert_model import Alert # If you create an Alert domain model
+from ..ports.scraped_price_repository_port import ScrapedPriceRepositoryPort
 
 from scraper import core as scraper_core
 from scraper import utils as scraper_utils
+from db.connection import get_db_pool
+from db import queries as db_queries
 
-# For API responses, we might need to define specific DTOs (Data Transfer Objects)
-# or use the Pydantic schemas defined in adapters/api/schemas.py if appropriate for use cases.
-# For now, use cases might return repository data or simple structures.
-from adapters.api import schemas as api_schemas # For structuring responses, be mindful of hexagonal layers
+from application_core.domain_models.product_info_model import ProductInfo
+import config
 
 logger = logging.getLogger(__name__)
 
+
 class CreateOrUpdateAlertUseCase:
-    def __init__(self, alert_repository: AlertRepositoryPort, user_repository: UserRepositoryPort):
+    def __init__(self, alert_repository: AlertRepositoryPort, user_repository: UserRepositoryPort,
+                 scraped_price_repository: ScrapedPriceRepositoryPort):
         self.alert_repository = alert_repository
         self.user_repository = user_repository
-        # Potentially inject scraper service/port here too if its logic becomes more complex
+        self.scraped_price_repository = scraped_price_repository
 
-    async def execute(self, idp_user_id: str, url: str, target_price: float) -> Tuple[Optional[asyncpg.Record], api_schemas.ScrapedProductInfo, str]:
-        # 1. Get or create user
-        # This part might be handled by a dedicated GetOrCreateUserByIdpIdUseCase instance
-        # For now, directly using user_repository for simplicity in this combined use case.
+    async def execute(self, idp_user_id: str, url: str, target_price: float) -> Tuple[
+        Alert, ProductInfo, str]:
         user = await self.user_repository.get_by_idp_id(idp_user_id)
         if not user:
-            # Logic for creating user if not found (simplified here, ideally from GetOrCreateUserByIdpIdUseCase)
-            logger.info(f"User with idp_user_id {idp_user_id} not found. API should ensure user exists or handle creation.")
-            # This use case might assume user exists or be part of a larger flow where user is created first.
-            # For now, let's raise an error or return a specific status if user creation is not in scope here.
-            raise ValueError(f"User with idp_user_id {idp_user_id} not found. Creation logic not implemented in this specific use case path.")
+            logger.info(
+                f"User with idp_user_id {idp_user_id} not found. API should ensure user exists or handle creation.")
+            raise ValueError(
+                f"User with idp_user_id {idp_user_id} not found. Creation logic not implemented in this specific use case path.")
 
-        if not user.telegram_chat_id:
-            logger.warning(f"User {user.id} (idp_user_id: {idp_user_id}) has no associated telegram_chat_id.")
-            raise ValueError("User profile is not associated with a Telegram chat.")
-
-        chat_id = user.telegram_chat_id
-
-        # 2. Clean URL
         cleaned_url = scraper_utils.clean_url(url)
         if not cleaned_url:
             raise ValueError("Invalid or unprocessable product URL.")
 
-        # 3. Scrape product info
-        product_info_dict = await scraper_core.get_product_info(url)
-        scraped_product_info_schema = api_schemas.ScrapedProductInfo(
+        # Siempre intentar usar ScraperAPI; scraper_core manejará si la clave no está.
+        product_info_dict = await scraper_core.get_product_info(url, use_api=True)
+        # Build domain model for product info
+        product_info = ProductInfo(
             name=product_info_dict.get("name"),
             price=product_info_dict.get("price"),
-            condition=product_info_dict.get("condition") or product_info_dict.get("product_condition"),
-            image=product_info_dict.get("image"),
+            product_condition=product_info_dict.get("condition"),
+            image_url=product_info_dict.get("image"),
             description=product_info_dict.get("description"),
             availability=product_info_dict.get("availability"),
             color=product_info_dict.get("color"),
             storage=product_info_dict.get("storage"),
             brand_name=product_info_dict.get("brand_name"),
-            clean_url=product_info_dict.get("clean_url", cleaned_url),
-            full_url=product_info_dict.get("full_url", url),
+            clean_url=cleaned_url, 
+            full_url=url,
             status=product_info_dict.get("status", "UNKNOWN_SCRAPE_STATUS")
         )
 
-        # 4. Create or Update Alert in DB
-        status_message = ""
-        alert_record = None
-        product_name_for_db = product_info_dict.get("name") if scraped_product_info_schema.status == "SCRAPED_SUCCESS" else None
+        try:
+            await self.scraped_price_repository.save_or_update_scraped_product(product_info)
+            logger.info(f"Successfully recorded scraped product info for {cleaned_url} in scraped_prices table via async use case.")
+        except Exception as e:
+            logger.error(f"Failed to record scraped product info for {cleaned_url} in CreateOrUpdateAlertUseCase (async): {e}")
 
-        existing_alert = await self.alert_repository.get_by_chat_and_clean_url(chat_id, cleaned_url)
+        alert = await self.alert_repository.upsert_alert(
+            user_id=user.id,
+            full_url=url,
+            clean_url=cleaned_url,
+            target_price=target_price
+        )
+        status_message = "Alert created or updated successfully."
+        return alert, product_info, status_message
 
-        if existing_alert:
-            alert_id = existing_alert['id']
-            await self.alert_repository.update_target_price(alert_id, target_price, url)
-            status_message = "Alert updated successfully."
-            alert_record = await self.alert_repository.get_by_id(alert_id)
-        else:
-            new_alert_id = await self.alert_repository.create_alert(
-                chat_id=chat_id,
-                full_url=url,
-                clean_url=cleaned_url,
-                target_price=target_price,
-                product_name=product_name_for_db
-            )
-            status_message = "Alert created successfully."
-            alert_record = await self.alert_repository.get_by_id(new_alert_id)
-
-        if not alert_record:
-            # This implies an issue after creation/update, e.g., get_by_id failed
-            raise Exception("Failed to retrieve alert details after database operation.")
-
-        return alert_record, scraped_product_info_schema, status_message
 
 class ListUserAlertsUseCase:
     def __init__(self, alert_repository: AlertRepositoryPort, user_repository: UserRepositoryPort):
         self.alert_repository = alert_repository
         self.user_repository = user_repository
 
-    async def execute(self, idp_user_id: str) -> List[asyncpg.Record]: # Or List[Alert]
+    async def execute(self, idp_user_id: str) -> List[Alert]:
         user = await self.user_repository.get_by_idp_id(idp_user_id)
         if not user:
             raise ValueError(f"User with idp_user_id {idp_user_id} not found.")
-        if not user.telegram_chat_id:
-            raise ValueError("User profile is not associated with a Telegram chat.")
+        alerts = await self.alert_repository.get_alerts_by_user_id(user.id)
+        return alerts
 
-        return await self.alert_repository.get_alerts_by_chat_id(user.telegram_chat_id)
 
 class DeleteAlertUseCase:
     def __init__(self, alert_repository: AlertRepositoryPort, user_repository: UserRepositoryPort):
@@ -117,46 +95,62 @@ class DeleteAlertUseCase:
         user = await self.user_repository.get_by_idp_id(idp_user_id)
         if not user:
             raise ValueError(f"User with idp_user_id {idp_user_id} not found.")
-        if not user.telegram_chat_id:
-            raise ValueError("User profile is not associated with a Telegram chat for ownership verification.")
-
-        chat_id_of_requesting_user = user.telegram_chat_id
-
-        alert_to_verify = await self.alert_repository.get_by_id(alert_id_to_delete)
-        if not alert_to_verify:
-            raise ValueError("Alert not found.") # Or a custom NotFoundError
-
-        if alert_to_verify['chat_id'] != chat_id_of_requesting_user:
-            # Forbidden access
+        # Verify ownership by user_id
+        alert = await self.alert_repository.get_by_id(alert_id_to_delete)
+        if not alert:
+            raise ValueError("Alert not found.")
+        if alert.user_id != user.id:
             raise PermissionError("User does not have permission to delete this alert.")
+        return await self.alert_repository.delete_alert(alert_id_to_delete, user.id)
 
-        return await self.alert_repository.delete_alert(alert_id_to_delete, chat_id_of_requesting_user)
 
 class GetProductInfoUseCase:
-    # This use case might not need a repository if it only uses the scraper
-    def __init__(self): # Potentially inject a scraper port/service
-        pass
-
-    async def execute(self, url: str) -> api_schemas.ScrapedProductInfo:
+    @staticmethod
+    async def execute(url: str) -> ProductInfo:
         if not url:
             raise ValueError("URL query parameter is required.")
         cleaned_url = scraper_utils.clean_url(url)
         if not cleaned_url:
             raise ValueError("Invalid or unprocessable product URL.")
 
-        product_info_dict = await scraper_core.get_product_info(url)
-        return api_schemas.ScrapedProductInfo(
+        should_use_scraper_api = bool(config.SCRAPERAPI_KEY)
+
+        # Intentar cache
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            cached = await db_queries.get_cached_price(conn, cleaned_url)
+        if cached:
+            return ProductInfo(
+                name=cached.get('name'),
+                price=cached.get('price'),
+                product_condition=cached.get('condition'),
+                image_url=cached.get('image'),
+                description=cached.get('description'),
+                availability=cached.get('availability'),
+                color=cached.get('color'),
+                storage=cached.get('storage'),
+                brand_name=cached.get('brand_name'),
+                clean_url=cleaned_url,
+                full_url=url,
+                status="CACHE_HIT"
+            )
+
+        product_info_dict = await scraper_core.get_product_info(url, use_api=True)
+        # Guardar en cache
+        async with pool.acquire() as conn:
+            await db_queries.save_scraped_price(conn, cleaned_url, product_info_dict)
+        # Return domain model
+        return ProductInfo(
             name=product_info_dict.get("name"),
             price=product_info_dict.get("price"),
-            condition=product_info_dict.get("condition") or product_info_dict.get("product_condition"),
-            image=product_info_dict.get("image"),
+            product_condition=product_info_dict.get("condition"),
+            image_url=product_info_dict.get("image"),
             description=product_info_dict.get("description"),
             availability=product_info_dict.get("availability"),
             color=product_info_dict.get("color"),
             storage=product_info_dict.get("storage"),
             brand_name=product_info_dict.get("brand_name"),
-            clean_url=product_info_dict.get("clean_url", cleaned_url),
-            full_url=product_info_dict.get("full_url", url),
+            clean_url=cleaned_url,
+            full_url=url,
             status=product_info_dict.get("status", "UNKNOWN_SCRAPE_STATUS")
         )
-

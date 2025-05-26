@@ -2,10 +2,11 @@
 import asyncpg
 import logging
 import config
-from typing import Optional # Import Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
-db_pool: Optional[asyncpg.Pool] = None # Explicitly type hint db_pool
+db_pool: Optional[asyncpg.Pool] = None 
+
 
 async def init_db_pool():
     """Initializes the asynchronous database connection pool."""
@@ -18,11 +19,11 @@ async def init_db_pool():
                 max_size=20  # Default is 10
             )
             logger.info("Database connection pool initialized successfully.")
-        except (asyncpg.exceptions.PostgresError, OSError) as e: # OSError for connection issues
+        except (asyncpg.exceptions.PostgresError, OSError) as e:
             logger.critical(f"CRITICAL error initializing database connection pool: {e}")
-            # Depending on application design, you might want to re-raise or exit
             raise
     return db_pool
+
 
 async def get_db_pool() -> asyncpg.Pool:
     """Returns the initialized database connection pool.
@@ -37,6 +38,7 @@ async def get_db_pool() -> asyncpg.Pool:
     assert db_pool is not None, "Database pool is not initialized and initialization failed."
     return db_pool
 
+
 async def close_db_pool():
     """Closes the asynchronous database connection pool."""
     global db_pool
@@ -49,14 +51,3 @@ async def close_db_pool():
             logger.error(f"Error closing database connection pool: {e}")
     else:
         logger.info("No database connection pool to close.")
-
-# Example of how to acquire a connection (to be used in repositories/use_cases):
-# async def example_usage():
-#     pool = await get_db_pool()
-#     async with pool.acquire() as connection:
-#         # Use the connection for queries
-#         # e.g., await connection.fetchval('SELECT 1')
-#         pass
-
-# Note: The original get_db_connection() and close_db_connection() using psycopg2
-# are removed as they are replaced by the async pool mechanism.
