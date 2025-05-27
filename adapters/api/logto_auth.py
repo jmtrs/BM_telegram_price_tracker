@@ -21,8 +21,8 @@ class UserInfo(BaseModel):
 
 
 # URLs de callback para autenticación
-SIGN_IN_CALLBACK = "/api/v1/auth/callback"
-BASE_URL = "http://localhost:8000"
+SIGN_IN_CALLBACK = "/v1/auth/callback"
+BASE_URL = config.LOGTO_AUDIENCE
 
 
 # Implementación de almacenamiento para FastAPI

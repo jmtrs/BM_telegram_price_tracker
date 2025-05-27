@@ -271,7 +271,7 @@ async def read_users_me(current_api_user: UserModel = Depends(get_current_user))
 
 
 # --- Logto Auth Endpoints ---
-@app.get("/api/v1/auth/signin", tags=["Auth"], include_in_schema=False)
+@app.get("/api/v1/auth/signin", tags=["Auth"])
 async def sign_in(request: Request, client: LogtoClient = Depends(get_logto_client)):
     """
     Inicia el flujo de autenticación con Logto, redirigiendo al usuario a la página de inicio de sesión de Logto.
@@ -280,7 +280,7 @@ async def sign_in(request: Request, client: LogtoClient = Depends(get_logto_clie
     return {"redirect_url": signin_url}
 
 
-@app.get("/api/v1/auth/callback", tags=["Auth"], include_in_schema=False)
+@app.get("/api/v1/auth/callback", tags=["Auth"])
 async def auth_callback(
     request: Request,
     client: LogtoClient = Depends(get_logto_client),
@@ -319,7 +319,7 @@ async def auth_callback(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Error en la autenticación: {str(e)}")
 
 
-@app.get("/api/v1/auth/signout", tags=["Auth"], include_in_schema=False) # Opcional
+@app.get("/api/v1/auth/signout", tags=["Auth"])
 async def sign_out(request: Request, client: LogtoClient = Depends(get_logto_client)):
     """
     Cierra la sesión del usuario con Logto.
