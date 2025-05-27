@@ -1,163 +1,188 @@
 # db/queries.py
 import logging
-from datetime import datetime, timedelta
-from .connection import get_db_connection
+from datetime import datetime, timedelta, timezone
+from uuid import UUID
 import config
+import asyncpg
 
 logger = logging.getLogger(__name__)
 
+
 # --- Scraped Prices Queries ---
 
-def get_cached_price(clean_url: str) -> dict | None:
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT price, product_condition, scraped_at,
-                   product_name, description, image_url,
-                   color, storage, brand_name
-            FROM scraped_prices
-            WHERE clean_url = %s
-            ORDER BY scraped_at DESC LIMIT 1
-        """, (clean_url,))
-        row = cur.fetchone()
-    if row and datetime.utcnow() - row['scraped_at'] < timedelta(minutes=config.SCRAPE_TTL_MINUTES):
-        logger.info(f"Usando datos completos de caché para {clean_url}")
-        return dict(row)
+async def get_cached_price(conn: asyncpg.Connection, clean_url: str) -> asyncpg.Record | None:
+    row = await conn.fetchrow("""
+        SELECT price, product_condition, scraped_at,
+               product_name, description, image_url,
+               color, storage, brand_name
+        FROM scraped_prices
+        WHERE clean_url = $1
+        ORDER BY scraped_at DESC LIMIT 1
+    """, clean_url)
+
+    if row:
+        scraped_at_aware = row['scraped_at'].replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - scraped_at_aware < timedelta(minutes=config.SCRAPE_TTL_MINUTES):
+            logger.info(f"Usando datos completos de caché para {clean_url}")
+            return row
     return None
 
-def save_scraped_price(clean_url: str, product_details: dict):
-    """Guarda o actualiza todos los detalles scrapeados del producto."""
-    conn = get_db_connection()
-    
-    # Crear un diccionario para los parámetros de la query,
-    # combinando clean_url con product_details.
+
+async def save_scraped_price(conn: asyncpg.Connection, clean_url: str, product_details: dict):
     params_for_query = {
-        'clean_url': clean_url, # Añadir clean_url explícitamente
+        'clean_url': clean_url,
         'price': product_details.get('price'),
-        'condition': product_details.get('condition'), # Asegúrate que 'condition' es la clave correcta
-                                                     # en product_details, o usa 'product_condition'
-                                                     # si así lo devuelve _parse_product_details y lo
-                                                     # espera la tabla.
-                                                     # La tabla tiene 'product_condition'.
-                                                     # _parse_product_details devuelve 'condition'.
-                                                     # Vamos a estandarizar.
-        'product_condition': product_details.get('condition'), # Usar la clave que _parse devuelve
-        'name': product_details.get('name'),
+        'product_condition': product_details.get('condition'),
+        'product_name': product_details.get('name'),
         'description': product_details.get('description'),
-        'image_url': product_details.get('image'), # La columna es image_url, el detalle es 'image'
+        'image_url': product_details.get('image'),
         'color': product_details.get('color'),
         'storage': product_details.get('storage'),
-        'brand_name': product_details.get('brand_name')
+        'brand_name': product_details.get('brand_name'),
+        'availability': product_details.get('availability')
     }
-
-    with conn.cursor() as cur:
-        sql = """
-            INSERT INTO scraped_prices (
-                clean_url, price, product_condition, scraped_at,
-                product_name, description, image_url, color, storage, brand_name
-            )
-            VALUES (
-                %(clean_url)s, %(price)s, %(product_condition)s, now(),
-                %(name)s, %(description)s, %(image_url)s, %(color)s, %(storage)s, %(brand_name)s
-            )
-            ON CONFLICT (clean_url) DO UPDATE SET
-                price = EXCLUDED.price,
-                product_condition = EXCLUDED.product_condition,
-                scraped_at = EXCLUDED.scraped_at,
-                product_name = EXCLUDED.product_name,
-                description = EXCLUDED.description,
-                image_url = EXCLUDED.image_url,
-                color = EXCLUDED.color,
-                storage = EXCLUDED.storage,
-                brand_name = EXCLUDED.brand_name
-        """
-        cur.execute(sql, params_for_query)
-    logger.info(f"Datos completos del producto guardados/actualizados para {clean_url}")
+    await conn.execute("""
+        INSERT INTO scraped_prices (clean_url, price, product_condition, product_name, description, image_url, color, storage, brand_name, availability)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ON CONFLICT (clean_url) DO UPDATE SET
+            price = EXCLUDED.price,
+            product_condition = EXCLUDED.product_condition,
+            product_name = EXCLUDED.product_name,
+            description = EXCLUDED.description,
+            image_url = EXCLUDED.image_url,
+            color = EXCLUDED.color,
+            storage = EXCLUDED.storage,
+            brand_name = EXCLUDED.brand_name,
+            availability = EXCLUDED.availability,
+            scraped_at = now()
+    """, clean_url, params_for_query['price'], params_for_query['product_condition'],
+                       params_for_query['product_name'], params_for_query['description'], params_for_query['image_url'],
+                       params_for_query['color'], params_for_query['storage'], params_for_query['brand_name'],
+                       params_for_query['availability'])
 
 
-def cleanup_old_scraped_prices():
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        # El intervalo para limpieza podría ir a config.py
-        cur.execute("DELETE FROM scraped_prices WHERE scraped_at < now() - interval '2 days'")
-        deleted_count = cur.rowcount
+async def cleanup_old_scraped_prices(conn: asyncpg.Connection) -> int:
+    result = await conn.execute("DELETE FROM scraped_prices WHERE scraped_at < now() - interval '2 days'")
+    deleted_count = int(result.split(" ")[1]) if result and result.startswith("DELETE ") else 0
     if deleted_count > 0:
         logger.info(f"Limpieza de caché: {deleted_count} registros eliminados.")
-    # else: # Loguear solo si algo se borró para reducir ruido
-    #     logger.info("Limpieza de caché: No hay registros antiguos que eliminar.")
     return deleted_count
+
 
 # --- Alerts Queries ---
 
-def get_alert_by_chat_and_clean_url(chat_id: int, clean_url: str) -> dict | None: # Renombrado
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM alerts WHERE chat_id=%s AND clean_url=%s", (chat_id, clean_url))
-        return cur.fetchone()
+async def get_alert_by_id(conn: asyncpg.Connection, alert_id: str) -> asyncpg.Record | None:
+    return await conn.fetchrow("SELECT * FROM alerts WHERE id::text = $1", alert_id)
 
-# NUEVA FUNCIÓN para obtener una alerta por su ID
-def get_alert_by_id(alert_id: str) -> dict | None:
-    """Obtiene una alerta específica por su ID (UUID como string)."""
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM alerts WHERE id::text = %s", (alert_id,))
-        return cur.fetchone()
 
-def update_alert_target_price(alert_id: str, target_price: float, full_url: str): # Renombrado
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE alerts SET target_price=%s, inserted_at=now(), full_url=%s WHERE id::text=%s",
-            (target_price, full_url, alert_id)
-        )
+async def update_alert_target_price(conn: asyncpg.Connection, alert_id: str, target_price: float, full_url: str):
+    await conn.execute(
+        "UPDATE alerts SET target_price=$1, inserted_at=now(), full_url=$2 WHERE id::text=$3",
+        target_price, full_url, alert_id
+    )
     logger.info(f"Alerta {alert_id} actualizada. Nuevo objetivo: {target_price}€")
 
-def create_alert(chat_id: int, full_url: str, clean_url: str, target_price: float, product_name: str | None = None):
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        # Podríamos considerar añadir product_name a la tabla alerts si queremos mostrarlo en /alerts sin joins
-        cur.execute("""
-            INSERT INTO alerts (chat_id, full_url, clean_url, target_price) 
-            VALUES (%s, %s, %s, %s) RETURNING id
-        """, (chat_id, full_url, clean_url, target_price))
-        new_alert_id = cur.fetchone()['id']
-    logger.info(f"Nueva alerta ID {new_alert_id} creada para chat_id {chat_id}, URL: {clean_url}, Objetivo: {target_price}€")
+
+async def create_alert(conn: asyncpg.Connection, user_id: UUID, full_url: str, clean_url: str, target_price: float,
+                       product_name: str | None = None) -> UUID:
+    row = await conn.fetchrow("""
+        INSERT INTO alerts (user_id, full_url, clean_url, target_price) 
+        VALUES ($1, $2, $3, $4) RETURNING id
+    """, user_id, full_url, clean_url, target_price)
+    new_alert_id = row['id']
+    logger.info(
+        f"Nueva alerta ID {new_alert_id} creada para user_id {user_id}, URL: {clean_url}, Objetivo: {target_price}€")
     return new_alert_id
 
 
-def get_user_alerts(chat_id: int) -> list[dict]:
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM alerts WHERE chat_id=%s ORDER BY inserted_at DESC", (chat_id,))
-        return cur.fetchall()
+async def upsert_alert(conn: asyncpg.Connection, user_id: UUID, full_url: str, clean_url: str, target_price: float) -> UUID:
+    """Insert or update an alert atomically with ON CONFLICT (user_id, clean_url)."""
+    row = await conn.fetchrow("""
+        INSERT INTO alerts (user_id, full_url, clean_url, target_price)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (user_id, clean_url) DO UPDATE SET
+            target_price = EXCLUDED.target_price,
+            full_url = EXCLUDED.full_url,
+            inserted_at = now()
+        RETURNING id
+    """, user_id, full_url, clean_url, target_price)
+    return row['id']
 
-def delete_alert_by_id(alert_id: str, chat_id: int) -> bool:
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM alerts WHERE id::text=%s AND chat_id=%s RETURNING id", (alert_id, chat_id))
-        deleted_row = cur.fetchone()
+
+async def get_user_alerts(conn: asyncpg.Connection, user_id: UUID) -> list[asyncpg.Record]:
+    return await conn.fetch("SELECT * FROM alerts WHERE user_id=$1 ORDER BY inserted_at DESC", user_id)
+
+
+async def delete_alert_by_id(conn: asyncpg.Connection, alert_id: str, user_id: UUID) -> bool:
+    deleted_row = await conn.fetchrow("DELETE FROM alerts WHERE id::text=$1 AND user_id=$2 RETURNING id", alert_id,
+                                      user_id)
     if deleted_row:
-        logger.info(f"Alerta {alert_id} eliminada para chat_id {chat_id}.")
+        logger.info(f"Alerta {alert_id} eliminada para user_id {user_id}.")
         return True
-    logger.warning(f"Intento de eliminar alerta {alert_id} (chat_id {chat_id}) fallido.")
+    logger.warning(f"Intento de eliminar alerta {alert_id} (user_id {user_id}) fallido.")
     return False
 
-def get_all_alerts() -> list[dict]:
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM alerts")
-        return cur.fetchall()
 
-def update_alert_last_price(alert_id: str, current_price: float | None):
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        # Si current_price es None, guardamos NULL en la BD
-        cur.execute(
-            "UPDATE alerts SET last_price=%s, inserted_at=now() WHERE id::text=%s",
-            (current_price, alert_id)
-        )
+async def get_all_alerts(conn: asyncpg.Connection) -> list[asyncpg.Record]:
+    return await conn.fetch("""
+        SELECT a.*, u.telegram_chat_id
+        FROM alerts a
+        JOIN users u ON a.user_id = u.id
+    """)
 
-def update_alert_last_notified(alert_id: str):
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("UPDATE alerts SET last_notified=now() WHERE id::text=%s", (alert_id,))
+
+async def update_alert_last_price(conn: asyncpg.Connection, alert_id: str, current_price: float | None):
+    await conn.execute(
+        "UPDATE alerts SET last_price=$1, inserted_at=now() WHERE id::text=$2",
+        current_price, alert_id
+    )
+
+
+async def update_alert_last_notified(conn: asyncpg.Connection, alert_id: str):
+    await conn.execute("UPDATE alerts SET last_notified=now() WHERE id::text=$1", alert_id)
+
+
+# --- User Queries ---
+
+async def get_user_by_id(conn: asyncpg.Connection, user_id: UUID) -> asyncpg.Record | None:
+    return await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+
+
+async def get_user_by_telegram_id(conn: asyncpg.Connection, telegram_chat_id: int) -> asyncpg.Record | None:
+    return await conn.fetchrow("SELECT * FROM users WHERE telegram_chat_id = $1", telegram_chat_id)
+
+
+async def get_user_by_idp_id(conn: asyncpg.Connection, idp_user_id: str) -> asyncpg.Record | None:
+    return await conn.fetchrow("SELECT id, telegram_chat_id, idp_user_id, username, created_at, is_active FROM users WHERE idp_user_id = $1", idp_user_id)
+
+
+async def add_user(conn: asyncpg.Connection, telegram_chat_id: int | None, idp_user_id: str | None,
+                   username: str | None, is_active: bool) -> asyncpg.Record | None:
+    # id es generado por la BD (DEFAULT gen_random_uuid())
+    # No se pasa user_id como argumento a esta función ni a la query SQL.
+    return await conn.fetchrow("""
+        INSERT INTO users (telegram_chat_id, idp_user_id, username, is_active)
+        VALUES ($1, $2, $3, $4)
+        -- Considera ON CONFLICT para telegram_chat_id e idp_user_id si tienen constraints UNIQUE
+        -- y quieres manejar duplicados de forma específica (ej. DO UPDATE o DO NOTHING y luego buscar)
+        -- Ejemplo si idp_user_id es UNIQUE y quieres actualizar en conflicto:
+        -- ON CONFLICT (idp_user_id) WHERE idp_user_id IS NOT NULL DO UPDATE SET
+        --   username = EXCLUDED.username,
+        --   is_active = EXCLUDED.is_active
+        -- RETURNING id, telegram_chat_id, idp_user_id, username, created_at, is_active
+        -- Ejemplo si telegram_chat_id es UNIQUE y quieres actualizar en conflicto:
+        -- ON CONFLICT (telegram_chat_id) WHERE telegram_chat_id IS NOT NULL DO UPDATE SET
+        --   username = EXCLUDED.username,
+        --   is_active = EXCLUDED.is_active
+        RETURNING id, telegram_chat_id, idp_user_id, username, created_at, is_active
+    """, telegram_chat_id, idp_user_id, username, is_active)
+
+
+async def update_user(conn: asyncpg.Connection, user_id: UUID, username: str | None,
+                      is_active: bool) -> asyncpg.Record | None:
+    return await conn.fetchrow("""
+        UPDATE users
+        SET username = $1, is_active = $2
+        WHERE id = $3
+        RETURNING *
+    """, username, is_active, user_id)
