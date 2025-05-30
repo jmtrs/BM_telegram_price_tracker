@@ -1,6 +1,7 @@
 # bot/handlers.py
 import logging
 import asyncio
+from urllib.parse import urlsplit # Añadir urlsplit
 from telegram import Update, InputMediaPhoto
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
@@ -28,6 +29,19 @@ async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Uso: /track <URL> <precio_objetivo>")
         return
     url, price_str = context.args
+
+    # Validación del dominio de la URL
+    try:
+        parsed_url = urlsplit(url)
+        if parsed_url.netloc.lower() != "www.backmarket.es":
+            logger.warning(f"/track: URL no pertenece a www.backmarket.es: {url}")
+            await update.message.reply_text("❌ Solo se admiten URLs de www.backmarket.es")
+            return
+    except Exception as e:
+        logger.warning(f"/track: Error al parsear la URL para validación de dominio: {url}, error: {e}")
+        await update.message.reply_text("❌ URL inválida.")
+        return
+
     try:
         target_price = float(price_str)
         if target_price <= 0:
@@ -50,6 +64,20 @@ async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         product_info = await scraper_core.get_product_info(url)
         logger.info(f"/track: product_info obtenido: {product_info}")
+
+        raw_status_check = product_info.get('status', 'UNKNOWN_STATUS')
+        product_name_check = product_info.get('name')
+        product_price_check = product_info.get('price')
+
+        if raw_status_check.startswith("SCRAPE_FAILED"):
+            logger.warning(f"/track: Scraping falló para URL {url} con estado {raw_status_check}. No se creará/actualizará la alerta.")
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=processing_message.message_id,
+                text=f"❌ No se pudo obtener información del producto desde la URL proporcionada (Estado: {raw_status_check}). La alerta no ha sido creada/actualizada."
+            )
+            return
+
     except Exception as e:
         logger.error(f"/track: Excepción al obtener product_info para {url}: {e}", exc_info=True)
         await context.bot.edit_message_text(
