@@ -2,9 +2,10 @@
 import logging
 import json
 import asyncio
-
-import requests
+import re
 from bs4 import BeautifulSoup
+
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 import config
 from db import queries as db_queries
@@ -12,166 +13,446 @@ from .utils import clean_url
 
 logger = logging.getLogger(__name__)
 
-def _parse_product_details(html_content: str, url_for_logging: str) -> dict:
-    details = {
-        "price": None, "availability": None, "condition": None,
-        "name": None, "description": None, "image": None,
-        "color": None, "storage": None, "brand_name": None
+
+def _normalize_condition(condition_text: str | None) -> str | None:
+    if not condition_text:
+        return None
+    
+    text = condition_text.lower().strip()
+
+    if text in ["prémium", "premium", "impecable"]:
+        return "Prémium"
+    if text == "excelente":
+        return "Excelente"
+    if text in ["muy bueno", "muy buen estado"]:
+        return "Muy bueno"
+    if text == "correcto":
+        return "Correcto"
+    
+    if "schema.org/" in text:
+        condition_part = text.split('/')[-1]
+        if condition_part == "newcondition": return "Nuevo"
+        if condition_part == "refurbishedcondition": return "Reacondicionado"
+        if condition_part == "usedcondition": return "Reacondicionado" 
+        if condition_part == "damagedcondition": return "Dañado"
+
+    if "newcondition" in text: return "Nuevo"
+    if "refurbishedcondition" in text: return "Reacondicionado"
+    if "damagedcondition" in text: return "Dañado"
+
+    if condition_text in ["Prémium", "Excelente", "Muy bueno", "Correcto", "Nuevo", "Reacondicionado", "Dañado"]:
+       return condition_text
+
+    return None
+
+
+def _parse_product_details(html_content: str, url: str) -> dict:
+    product_data = {
+        'name': None, 'price': None, 'condition': None, 'availability': None,
+        'sku': None, 'description': None, 'image': None, 'color': None, 
+        'storage': None, 'brand_name': None, 'url': url, 'source': '' 
     }
-    try:
-        soup = BeautifulSoup(html_content, "html.parser")
-        scripts = soup.find_all("script", type="application/ld+json")
-        product_data_found = False
-        for script in scripts:
-            if not script.string:
-                continue
-            data = json.loads(script.string)
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, dict) and item.get("@type") == "Product":
-                        data = item
-                        break
-                else:
-                    continue
-            if isinstance(data, dict) and data.get("@type") == "Product":
-                product_data_found = True
-                details["name"] = data.get("name")
-                details["description"] = data.get("description")
-                image_data = data.get("image")
-                if isinstance(image_data, list) and image_data:
-                    details["image"] = image_data[0]
-                elif isinstance(image_data, str):
-                    details["image"] = image_data
-                details["color"] = data.get("color")
-                details["storage"] = data.get("storage")
-                brand_data = data.get("brand")
-                if isinstance(brand_data, dict):
-                    details["brand_name"] = brand_data.get("name")
-                elif isinstance(brand_data, str):
-                    details["brand_name"] = brand_data
-                offers_data = data.get("offers")
-                if offers_data:
-                    offer = None
-                    if isinstance(offers_data, list):
-                        if offers_data: offer = offers_data[0]
-                    elif isinstance(offers_data, dict):
-                        offer = offers_data
-                    if offer and isinstance(offer, dict) and "price" in offer:
-                        try:
-                            details["price"] = float(offer["price"])
-                        except (ValueError, TypeError):
-                            logger.warning(f"Precio inválido '{offer['price']}' en {url_for_logging}")
-                        details["availability"] = offer.get("availability", "").split("/")[-1]
-                        item_condition_url = offer.get("itemCondition")
-                        if isinstance(item_condition_url, str):
-                            details["condition"] = item_condition_url.split("/")[-1]
-                        logger.info(f"Detalles parseados (JSON-LD) para {url_for_logging}")
-                        return details
-        if not product_data_found:
-             logger.info(f"No se encontró '@type': 'Product' en JSON-LD para {url_for_logging}")
-        elif details["price"] is None:
-            logger.info(f"'Product' hallado pero sin oferta/precio válido en JSON-LD para {url_for_logging}")
-    except json.JSONDecodeError as e:
-        logger.warning(f"JSONDecodeError para {url_for_logging}: {e}")
-    except Exception as e:
-        logger.error(f"Error procesando contenido para {url_for_logging}: {e}", exc_info=True)
-    return details
+    source_parts = ['initial'] 
+    soup = BeautifulSoup(html_content, 'html.parser')
 
-def _fetch_url_content_attempt(full_url: str, use_api: bool) -> requests.Response:
-    # Esta función es SÍNCRONA y será ejecutada en un hilo por asyncio.to_thread
-    logger.info(f"SYNC_FETCH_ATTEMPT: Iniciando petición síncrona para {full_url}. Timeout={config.API_TIMEOUT_SECONDS}s. Usar API: {use_api}")
-    response = None
-    if use_api and config.SCRAPERAPI_KEY:
-        payload = {'api_key': config.SCRAPERAPI_KEY, 'url': full_url, 'max_cost': config.SCRAPER_MAX_COST}
-        response = requests.get("https://api.scraperapi.com/", params=payload, timeout=config.API_TIMEOUT_SECONDS)
+    name_from_html = None
+    name_tag_specific = soup.find('h1', attrs={'data-test-id': 'product-title'})
+    if name_tag_specific:
+        name_from_html = name_tag_specific.get_text(strip=True)
     else:
-        if not use_api:
-            logger.debug(f"SYNC_FETCH_ATTEMPT: Usando petición directa (use_api=False) para {full_url}")
+        name_tag_generic = soup.find('h1')
+        if name_tag_generic:
+            name_from_html = name_tag_generic.get_text(strip=True)
+    
+    product_json_ld = None
+    json_ld_scripts = soup.find_all('script', type='application/ld+json')
+    for script_tag in json_ld_scripts:
+        if script_tag.string:
+            try:
+                data = json.loads(script_tag.string)
+                items_to_check = data if isinstance(data, list) else [data]
+                for item in items_to_check:
+                    if isinstance(item, dict) and 'Product' in item.get('@type', ''):
+                        product_json_ld = item
+                        break
+                if product_json_ld: break
+            except json.JSONDecodeError:
+                logger.warning(f"Fallo al decodificar JSON-LD para {url}. Contenido: {script_tag.string[:200]}...", exc_info=False)
+            except Exception as e:
+                 logger.error(f"Error inesperado procesando JSON-LD para {url}: {e}. Contenido: {script_tag.string[:200]}...", exc_info=False)
+    
+    if product_json_ld:
+        source_parts.append("jsonld_parsed")
+        
+        product_data['name'] = product_json_ld.get('name')
+        product_data['description'] = product_json_ld.get('description')
+        image_data = product_json_ld.get('image')
+        if isinstance(image_data, list):
+            product_data['image'] = image_data[0] if image_data else None
+        elif isinstance(image_data, dict):
+            product_data['image'] = image_data.get('url')
         else:
-            logger.warning(f"SYNC_FETCH_ATTEMPT: SCRAPERAPI_KEY no configurado. Usando petición directa para {full_url}")
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-        response = requests.get(full_url, headers=headers, timeout=config.API_TIMEOUT_SECONDS)
-    logger.info(f"SYNC_FETCH_ATTEMPT: Petición síncrona para {full_url} completada. Status: {response.status_code if response else 'No Response'}")
-    if response:
-        response.raise_for_status()
-    elif not response :
-        raise requests.exceptions.RequestException("No se obtuvo respuesta del servidor (variable response es None).")
-    return response
+            product_data['image'] = image_data 
+        
+        product_data['sku'] = product_json_ld.get('sku')
+        brand_data = product_json_ld.get('brand', {})
+        if isinstance(brand_data, dict):
+            product_data['brand_name'] = brand_data.get('name')
 
-async def fetch_product_details_from_url(full_url: str, use_api: bool = True) -> tuple[str | None, str | None]:
-    response_text = None
-    status = None
-    for attempt in range(config.MAX_RETRIES_SCRAPER + 1):
-        try:
-            log_prefix = f"[API Intento {attempt + 1}]" if use_api and config.SCRAPERAPI_KEY else f"[Directo Intento {attempt + 1}]"
-            logger.info(f"{log_prefix} Preparando para obtener {full_url}")
-            # Ejecutar la función de red en un hilo separado
-            # usando asyncio.to_thread para evitar bloquear el hilo principal
-            response_object = await asyncio.to_thread(_fetch_url_content_attempt, full_url, use_api)
-            response_text = response_object.text
-            status = 'SUCCESS'
-            break
-        except requests.exceptions.Timeout:
-            logger.warning(f"Timeout en intento {attempt + 1} para {full_url} (después de {config.API_TIMEOUT_SECONDS}s)")
-            status = 'TIMEOUT_ERROR'
-        except requests.exceptions.HTTPError as e:
-            logger.warning(f"HTTPError intento {attempt + 1} para {full_url}: {e.response.status_code if e.response else 'Unknown status'}")
-            status = 'API_ERROR' if use_api and config.SCRAPERAPI_KEY else 'REQUEST_ERROR'
-            if e.response and e.response.status_code in [401, 403, 404] and attempt == config.MAX_RETRIES_SCRAPER:
-                logger.error(f"Error cliente ({e.response.status_code}) para {full_url}. Sin más reintentos.")
-                break
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"RequestException intento {attempt + 1} para {full_url}: {e}")
-            status = 'REQUEST_ERROR'
-        except Exception as e_general:
-            logger.error(f"Excepción general en intento {attempt + 1} para {full_url} originada en to_thread: {e_general}", exc_info=True)
-            status = 'THREAD_EXECUTION_ERROR'
-        if attempt < config.MAX_RETRIES_SCRAPER:
-            logger.info(f"Reintentando en {config.RETRY_DELAY_SCRAPER_SECONDS}s...")
-            await asyncio.sleep(config.RETRY_DELAY_SCRAPER_SECONDS)
+        # Extracción de Color desde JSON-LD (directamente como string)
+        color_value_from_json_ld = product_json_ld.get('color')
+        if isinstance(color_value_from_json_ld, str):
+            product_data['color'] = color_value_from_json_ld.strip()
+            source_parts.append("color_jsonld_direct")
+        elif color_value_from_json_ld: # Si existe pero no es string, loguear
+            source_parts.append("color_jsonld_type_mismatch")
         else:
-            logger.error(f"Todos los {config.MAX_RETRIES_SCRAPER + 1} intentos fallaron para {full_url}.")
-    if response_text is None and status != 'SUCCESS':
-        status = 'NO_TEXT' if status is None else status
-    return response_text, status
+            source_parts.append("color_jsonld_not_found")
+        
+        # Extracción de Storage desde JSON-LD (directamente como string)
+        storage_value_from_json_ld = product_json_ld.get('storage')
+        if isinstance(storage_value_from_json_ld, str):
+            product_data['storage'] = storage_value_from_json_ld.strip()
+            source_parts.append("storage_jsonld_direct")
+        elif storage_value_from_json_ld: # Si existe pero no es string, loguear
+            source_parts.append("storage_jsonld_type_mismatch")
+        else:
+            source_parts.append("storage_jsonld_not_found")
+
+        offers_data = product_json_ld.get('offers', {})
+        if isinstance(offers_data, list): 
+            offers_data = offers_data[0] if offers_data else {}
+        if not isinstance(offers_data, dict): # Asegurar que offers_data sea un dict para .get()
+            offers_data = {}
+
+        availability_raw_from_json_ld = offers_data.get('availability')
+        normalized_availability = None
+        if availability_raw_from_json_ld and isinstance(availability_raw_from_json_ld, str):
+            availability_lower = availability_raw_from_json_ld.lower()
+            if "instock" in availability_lower:
+                normalized_availability = "En stock"
+                source_parts.append("availability_jsonld_instock")
+            elif "outofstock" in availability_lower:
+                normalized_availability = "Agotado"
+                source_parts.append("availability_jsonld_outofstock")
+            elif "preorder" in availability_lower:
+                normalized_availability = "En preventa"
+                source_parts.append("availability_jsonld_preorder")
+            elif "soldout" in availability_lower:
+                normalized_availability = "Agotado"
+                source_parts.append("availability_jsonld_soldout")
+            elif "discontinued" in availability_lower:
+                normalized_availability = "Discontinuado"
+                source_parts.append("availability_jsonld_discontinued")
+            else: 
+                if "schema.org/" in availability_raw_from_json_ld: # Usar el término de schema.org si es una URL
+                    normalized_availability = availability_raw_from_json_ld.split('/')[-1]
+                else: # Usar el valor crudo si no es un término conocido ni URL de schema.org
+                    normalized_availability = availability_raw_from_json_ld
+                source_parts.append("availability_jsonld_other")
+            product_data['availability'] = normalized_availability
+        elif availability_raw_from_json_ld: # Si no es string pero existe (ej. booleano, número)
+            product_data['availability'] = str(availability_raw_from_json_ld) 
+            source_parts.append("availability_jsonld_raw_type_unexpected")
+    else: # Si no se encontró product_json_ld
+        product_json_ld = {} # Asegurar que es un dict para evitar errores en .get() más adelante
+        offers_data = {}   # Asegurar que offers_data también es un dict
+
+    if name_from_html:
+        product_data['name'] = name_from_html
+        source_parts.append("name_html")
+    elif product_data['name']: # Si no hay nombre HTML pero sí de JSON-LD
+        source_parts.append("name_jsonld")
+
+    price_from_html = None
+    price_selectors = [
+        {"attrs": {"data-qa": "productpage-product-price"}},
+        {"attrs": {"data-test": "productpage-product-price"}},
+        {"attrs": {"data-test": "price"}}
+    ]
+    for selector in price_selectors:
+        price_tag = soup.find(**selector)
+        if price_tag:
+            price_text = price_tag.get_text(strip=True)
+            if price_text:
+                price_text_cleaned = price_text.replace('€', '').replace('\\xa0', '').replace('.', '').replace(',', '.').strip()
+                try:
+                    price_from_html = float(price_text_cleaned)
+                    break 
+                except ValueError:
+                    logger.warning(f"No se pudo convertir precio HTML '{price_text_cleaned}' a float para {url}")
+    
+    price_from_json_ld = None
+    price_from_json_ld_str = offers_data.get('price') # offers_data ya está garantizado como dict
+    if price_from_json_ld_str:
+        try:
+            price_from_json_ld = float(price_from_json_ld_str)
+        except (ValueError, TypeError):
+            logger.warning(f"No se pudo convertir precio JSON-LD '{price_from_json_ld_str}' a float para {url}")
+
+    if price_from_html is not None:
+        product_data['price'] = price_from_html
+        source_parts.append("price_html")
+    elif price_from_json_ld is not None:
+        product_data['price'] = price_from_json_ld
+        source_parts.append("price_jsonld")
+    else:
+        source_parts.append("price_unavailable")
+
+    grade_condition_from_html = None
+    raw_grade_text_final = None
+    
+    # Selectores CSS para elementos que indican el estado/grado seleccionado
+    selected_elements_candidates = soup.select(
+        '[aria-pressed="true"], [aria-checked="true"], [aria-selected="true"], '
+        '.selected, .active, .is-selected, .is-active, .current, .activated, .selected_item, '
+        '[class*="--selected"], [class*="-selected"], [class*="_selected"], '
+        '[class*="--active"], [class*="-active"], [class*="_active"], '
+        '[class*="--current"], [class*="-current"], [class*="_current"]'
+    )
+    
+    common_non_condition_words = [
+        "iphone", "ver detalles", "elegir", "estado", "color", "capacidad", 
+        "wifi", "ipad", "air", "gb", "descuento", "ahorra", "disponible"
+    ]
+
+    for elem in selected_elements_candidates:
+        temp_raw_text = None
+        
+        # Prioridad 1: Texto dentro de <span>
+        spans = elem.find_all('span', recursive=True)
+        for span_elem in spans:
+            span_text = span_elem.get_text(strip=True)
+            # Validar si el texto del span es una condición y cumple criterios básicos
+            if _normalize_condition(span_text) and \
+               (2 < len(span_text) < 30) and \
+               not span_text.isdigit() and \
+               "€" not in span_text and \
+               not any(word in span_text.lower() for word in ["dct", "ahorra"]):
+                temp_raw_text = span_text
+                break 
+        
+        # Prioridad 2: Texto directo del elemento si no se encontró en <span>
+        if not temp_raw_text:
+            direct_text = elem.get_text(strip=True)
+            if _normalize_condition(direct_text) and len(direct_text) < 30: 
+                temp_raw_text = direct_text
+            else:
+                # Si el texto directo no es una condición, buscar partes que sí lo sean
+                # Corregido: Usar r'\b' para que la regex interprete \b como word boundary correctamente.
+                parts = re.findall(r'\b[A-Za-záéíóúÁÉÍÓÚüÜñÑ]{3,}(?:\s+[A-Za-záéíóúÁÉÍÓÚüÜñÑ]{2,})?\b', direct_text)
+                for part in parts:
+                    normalized_part_check = _normalize_condition(part)
+                    if normalized_part_check:
+                        # Filtrar palabras comunes que podrían normalizarse accidentalmente
+                        if not part.isdigit() and "€" not in part and \
+                           not any(word == part.lower() for word in common_non_condition_words):
+                            temp_raw_text = part
+                            break 
+                            
+        if temp_raw_text:
+            # Verificación final: el texto extraído debe ser normalizable
+            normalized_condition_check = _normalize_condition(temp_raw_text)
+            if normalized_condition_check:
+                raw_grade_text_final = temp_raw_text
+                break 
+
+    if raw_grade_text_final:
+        normalized_grade = _normalize_condition(raw_grade_text_final)
+        if normalized_grade:
+            grade_condition_from_html = normalized_grade
+
+    # Condición de JSON-LD (fallback)
+    condition_from_json_ld_schema = offers_data.get('itemCondition')
+    normalized_json_ld_condition = None
+    if condition_from_json_ld_schema:
+        # Extraer el término de la condición (ej. "NewCondition" de "http://schema.org/NewCondition")
+        raw_condition_str = str(condition_from_json_ld_schema).split('/')[-1] if "schema.org/" in str(condition_from_json_ld_schema) else str(condition_from_json_ld_schema)
+        normalized_json_ld_condition = _normalize_condition(raw_condition_str)
+        if normalized_json_ld_condition:
+             logger.info(f"Condición JSON-LD normalizada: '{normalized_json_ld_condition}' (raw: '{raw_condition_str}') para {url}")
+        else:
+             logger.warning(f"Condición JSON-LD '{raw_condition_str}' no pudo ser normalizada para {url}.")
+
+    # Asignación final de la condición con prioridad
+    if grade_condition_from_html:
+        product_data['condition'] = grade_condition_from_html
+        source_parts.append("condition_html_grade")
+    elif normalized_json_ld_condition:
+        product_data['condition'] = normalized_json_ld_condition
+        source_parts.append("condition_jsonld")
+    else:
+        source_parts.append("condition_unavailable")
+        
+    product_data['source'] = ",".join(list(dict.fromkeys(source_parts))) # Deduplicar fuentes manteniendo orden
+
+    return product_data
+
+
+async def get_html_from_url(url: str, timeout_seconds: int = config.API_TIMEOUT_SECONDS) -> str | None:
+    logger.info(f"Iniciando scraping con Playwright para URL: {url}")
+    browser = None
+    context = None
+    page = None
+    effective_timeout_ms = timeout_seconds * 1000
+    
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            )
+            page = await context.new_page()
+            
+            response = await page.goto(url, timeout=effective_timeout_ms, wait_until='domcontentloaded')
+
+            if response and response.ok:
+                html_content = await page.content()
+                return html_content
+            elif response:
+                logger.error(f"Error al obtener HTML de {url}. Status: {response.status} {response.status_text}")
+            else: # No response object
+                logger.error(f"No se recibió respuesta HTTP válida de {url}.")
+            return None # Explicitly return None on failure within try block
+                
+    except PlaywrightTimeoutError:
+        logger.error(f"Timeout ({timeout_seconds}s) al obtener HTML para {url}")
+        return None
+    except Exception as e:
+        logger.error(f"Error general al obtener HTML de {url} con Playwright: {e}", exc_info=True)
+        return None
+    finally:
+        # Cerrar recursos de Playwright en orden inverso a su creación
+        if page and not page.is_closed():
+            try:
+                await page.close()
+            except Exception as e:
+                logger.warning(f"Excepción al cerrar la página de Playwright para {url}: {e}")
+        if context: # No hay método is_closed() estándar para context, intentar cerrar siempre
+            try:
+                await context.close()
+            except Exception as e:
+                if "Target page, context or browser has been closed" in str(e) or "context.close: Target closed" in str(e):
+                    logger.warning(f"Contexto de Playwright para {url} ya estaba cerrado: {e}")
+                else:
+                    logger.error(f"Error al cerrar el contexto de Playwright para {url}: {e}", exc_info=False)
+        if browser and browser.is_connected():
+            try:
+                await browser.close()
+            except Exception as e:
+                logger.error(f"Error al cerrar el navegador de Playwright para {url}: {e}", exc_info=False)
+
+async def fetch_product_details_from_url(full_url: str) -> tuple[str | None, str | None]:
+    """
+    Intenta obtener el contenido HTML de una URL, con reintentos.
+    Devuelve una tupla (html_content, status_string).
+    """
+    html_content = None
+    status = 'INIT'
+
+    for attempt in range(config.MAX_RETRIES_SCRAPER + 1): # +1 para incluir el intento inicial
+        try:
+            html_content = await get_html_from_url(full_url, config.API_TIMEOUT_SECONDS)
+            
+            if html_content:
+                status = 'SUCCESS'
+                logger.info(f"HTML obtenido para {full_url} en intento {attempt + 1}")
+                break 
+            else: # get_html_from_url devolvió None, el error ya fue logueado allí
+                status = 'REQUEST_ERROR_NO_CONTENT' 
+        except Exception as e: # Captura errores inesperados directamente de get_html_from_url si los hubiera
+            status = 'REQUEST_EXCEPTION' # Un error más genérico si la excepción no fue manejada dentro de get_html_from_url
+        
+        if attempt < config.MAX_RETRIES_SCRAPER:
+            await asyncio.sleep(config.RETRY_DELAY_SCRAPER_SECONDS)
+        else: # Último intento fallido
+            logger.error(f"Todos los {config.MAX_RETRIES_SCRAPER + 1} intentos fallaron para {full_url}. Último estado: {status}")
+            
+    if not html_content and status != 'SUCCESS':
+        status = status if status != 'INIT' else 'ALL_ATTEMPTS_FAILED'
+        
+    return html_content, status
 
 async def get_product_info(url_to_scrape: str) -> dict:
     cleaned_url_str = clean_url(url_to_scrape)
-    logger.info(f"GET_PRODUCT_INFO: URL original: {url_to_scrape}, URL limpiada para caché: {cleaned_url_str}")
-    cached_product_info = await asyncio.to_thread(db_queries.get_cached_price, cleaned_url_str)
-    if cached_product_info:
-        logger.info(f"Usando datos completos de caché para {cleaned_url_str}")
-        cached_product_info["clean_url"] = cleaned_url_str
-        cached_product_info["full_url"] = url_to_scrape
-        cached_product_info["status"] = "CACHE_HIT"
-        cached_product_info.setdefault("price", None)
-        cached_product_info.setdefault("availability", "N/A (cache)")
-        cached_product_info.setdefault("condition", cached_product_info.get("product_condition"))
-        return cached_product_info
-    logger.info(f"No hay caché válida para {cleaned_url_str}, procediendo a scrapear.")
-    use_api_for_this_url = True 
-    if not config.SCRAPERAPI_KEY:
-        logger.warning(f"SCRAPERAPI_KEY no disponible. El scraping para {url_to_scrape} podría fallar.")
-    html_content, fetch_status = await fetch_product_details_from_url(url_to_scrape, use_api=use_api_for_this_url)
-    base_fail_response = {
+    # Intento de caché primero
+    try:
+        cached_product_info = await asyncio.to_thread(db_queries.get_cached_price, cleaned_url_str)
+        if cached_product_info:
+            # Asegurar que los campos esperados estén presentes, incluso si vienen de caché
+            final_cached_info = {
+                "price": cached_product_info.get("price"),
+                "availability": cached_product_info.get("availability", "N/A (cache)"),
+                "condition": cached_product_info.get("product_condition", cached_product_info.get("condition")),
+                "name": cached_product_info.get("name", cached_product_info.get("product_name")),
+                "description": cached_product_info.get("description"),
+                "image": cached_product_info.get("image_url", cached_product_info.get("image")),
+                "color": cached_product_info.get("color"),
+                "storage": cached_product_info.get("storage"),
+                "brand_name": cached_product_info.get("brand_name"),
+                "clean_url": cleaned_url_str,
+                "full_url": url_to_scrape,
+                "status": "CACHE_HIT",
+                "source": cached_product_info.get("source", "cache")
+            }
+            return final_cached_info
+    except Exception as e:
+        logger.error(f"Error al acceder a la caché para {cleaned_url_str}: {e}", exc_info=True)
+    
+    html_content, fetch_status = await fetch_product_details_from_url(url_to_scrape)
+    
+    base_response = {
         "price": None, "availability": None, "condition": None,
         "name": None, "description": None, "image": None,
         "color": None, "storage": None, "brand_name": None,
         "clean_url": cleaned_url_str, "full_url": url_to_scrape,
-        "status": f"SCRAPE_FAILED_{fetch_status}"
+        "status": f"SCRAPE_FAILED_{fetch_status}",
+        "source": "scrape_attempt"
     }
+    
     if fetch_status == 'SUCCESS' and html_content:
-        product_details = _parse_product_details(html_content, url_to_scrape)
-        if product_details.get("price") is not None:
-            await asyncio.to_thread(
-                db_queries.save_scraped_price,
-                cleaned_url_str,
-                product_details
-            )
-        final_details = base_fail_response.copy()
-        final_details.update(product_details)
-        final_details["status"] = "SCRAPED_SUCCESS"
-        return final_details
-    else:
-        logger.error(f"Fallo al obtener/parsear detalles para {url_to_scrape}. Estado final: {base_fail_response['status']}")
-        return base_fail_response
+        try:
+            product_details = _parse_product_details(html_content, url_to_scrape)
+            
+            # Actualizar la respuesta base con los detalles parseados
+            # Esto asegura que todos los campos estén presentes en la respuesta final
+            final_details = base_response.copy()
+            final_details.update(product_details)
+
+            # Verificar atributos clave después del parseo
+            missing_attributes = [
+                key for key in ["price", "condition"]
+                if not final_details.get(key)
+            ]
+
+            if missing_attributes:
+                final_details["status"] = f"SCRAPED_INCOMPLETE_{fetch_status}"
+            else:
+                final_details["status"] = f"SCRAPED_SUCCESS_{fetch_status}"
+            
+            # Guardar en BD (incluso si está incompleto, para análisis o reintentos manuales)
+            try:
+                await asyncio.to_thread(
+                    db_queries.save_scraped_price,
+                    cleaned_url_str,
+                    final_details # Guardar el diccionario completo y enriquecido
+                )
+            except Exception as e:
+                final_details["status"] += "_DB_SAVE_ERROR"
+
+            return final_details
+        except Exception as e:
+            base_response["status"] = f"SCRAPE_FAILED_PARSE_ERROR_{fetch_status}"
+            # Intentar guardar lo que se tenga (URL y estado de fallo de parseo)
+            try:
+                await asyncio.to_thread(db_queries.save_scraped_price, cleaned_url_str, base_response)
+            except Exception as db_e:
+                logger.error(f"Error al guardar fallo de parseo en BD para {cleaned_url_str}: {db_e}", exc_info=True)
+            return base_response
+    else: # fetch_status no fue 'SUCCESS' o html_content es None
+        try:
+            await asyncio.to_thread(db_queries.save_scraped_price, cleaned_url_str, base_response)
+        except Exception as db_e:
+            logger.error(f"Error al guardar fallo de obtención de HTML en BD para {cleaned_url_str}: {db_e}", exc_info=True)
+        return base_response
+

@@ -21,65 +21,101 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_MESSAGE_MARKDOWN, parse_mode=ParseMode.MARKDOWN)
 
 async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"Comando /track recibido con args: {context.args}")
     chat_id = update.effective_chat.id
     if not context.args or len(context.args) != 2:
+        logger.warning(f"/track: Argumentos inválidos: {context.args}")
         await update.message.reply_text("❌ Uso: /track <URL> <precio_objetivo>")
         return
     url, price_str = context.args
     try:
         target_price = float(price_str)
         if target_price <= 0:
+            logger.warning(f"/track: Precio objetivo no positivo: {target_price}")
             await update.message.reply_text("❌ El precio objetivo debe ser un número positivo.")
             return
     except ValueError:
+        logger.warning(f"/track: Precio objetivo no es un número: {price_str}")
         await update.message.reply_text("❌ El precio objetivo debe ser un número.")
         return
     
     cleaned_url = scraper_utils.clean_url(url)
     if not cleaned_url:
+        logger.warning(f"/track: URL inválida o no se pudo procesar: {url}")
         await update.message.reply_text("❌ URL inválida o no se pudo procesar.")
         return
 
     processing_message = await update.message.reply_text("⚙️ Procesando tu solicitud...")
 
-    product_info = await scraper_core.get_product_info(url)
-    product_name_for_db = product_info.get("name") if product_info.get("status") == "SCRAPED_SUCCESS" else None
+    try:
+        product_info = await scraper_core.get_product_info(url)
+        logger.info(f"/track: product_info obtenido: {product_info}")
+    except Exception as e:
+        logger.error(f"/track: Excepción al obtener product_info para {url}: {e}", exc_info=True)
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=processing_message.message_id,
+            text="❌ Error crítico al obtener información del producto. Inténtalo de nuevo más tarde."
+        )
+        return
+        
+    product_name_for_db = product_info.get("name")
     
-    # Usar la función renombrada y la lógica de creación/actualización
-    existing_alert = await asyncio.to_thread(db_queries.get_alert_by_chat_and_clean_url, chat_id, cleaned_url)
-    response_key_part = ""
+    base_response_text = "" 
+    try:
+        existing_alert = await asyncio.to_thread(db_queries.get_alert_by_chat_and_clean_url, chat_id, cleaned_url)
 
-    if existing_alert:
-        await asyncio.to_thread(db_queries.update_alert_target_price, str(existing_alert['id']), target_price, url)
-        response_key_part = "🔁 Alerta actualizada."
-    else:
-        # Pasar product_name a create_alert si se quiere guardar en tabla alerts en el futuro
-        await asyncio.to_thread(db_queries.create_alert, chat_id, url, cleaned_url, target_price, product_name_for_db)
-        response_key_part = "✅ Alerta creada correctamente."
+        if existing_alert:
+            await asyncio.to_thread(db_queries.update_alert_target_price, str(existing_alert['id']), target_price, url)
+            base_response_text = "🔁 Alerta actualizada."
+            logger.info(f"/track: Alerta actualizada ID {existing_alert['id']} para chat {chat_id}")
+        else:
+            await asyncio.to_thread(db_queries.create_alert, chat_id, url, cleaned_url, target_price, product_name_for_db)
+            base_response_text = "✅ Alerta creada correctamente."
+            logger.info(f"/track: Nueva alerta creada para chat {chat_id}, URL: {cleaned_url}")
+    except Exception as e:
+        logger.error(f"/track: Excepción durante operaciones de base de datos: {e}", exc_info=True)
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=processing_message.message_id,
+            text="❌ Error crítico al guardar la alerta en la base de datos."
+        )
+        return
 
-    # Formatear el mensaje de respuesta
-    # format_product_info_message ahora devuelve (texto, teclado), pero para /track no necesitamos teclado aquí.
     message_text_body, _ = format_product_info_message(product_info, target_price)
     
-    if product_info['status'] in ["CACHE_HIT", "SCRAPED_SUCCESS"]:
-        full_response_message = f"{response_key_part}\n\n{message_text_body}"
-    elif product_info['status'].startswith("SCRAPE_FAILED"):
-        full_response_message = (f"{response_key_part}\n\n"
-                                 f"⚠️ No se pudo obtener la información completa del producto (Estado: {product_info['status']}).\n"
-                                 f"La alerta ha sido creada/actualizada con objetivo {target_price}€ para:\n🔗 {url}")
-    else:
-        full_response_message = (f"{response_key_part}\n\n"
-                                 f"❓ Estado desconocido al obtener info del producto.\n"
-                                 f"Alerta creada/actualizada con objetivo {target_price}€ para:\n🔗 {url}")
+    raw_status = product_info.get('status', 'UNKNOWN_STATUS')
+    
+    status_display = raw_status 
 
-    # Intentar enviar con foto si está disponible y es un scrapeo exitoso
+    full_response_message = ""
+    if raw_status == "CACHE_HIT" or raw_status.startswith("SCRAPED_SUCCESS"):
+        full_response_message = f"{base_response_text}\n{message_text_body}"
+    elif raw_status.startswith("SCRAPED_INCOMPLETE"):
+        full_response_message = (f"{base_response_text}\n{message_text_body}\n"
+                                 f"⚠️ _Algunos detalles del producto no pudieron ser obtenidos (Estado: {status_display})_")
+    elif raw_status.startswith("SCRAPE_FAILED"):
+        escaped_target_price = scraper_utils.escape_markdown_v2(str(target_price))
+        full_response_message = (f"{base_response_text}\n"
+                                 f"⚠️ No se pudo obtener la información completa del producto (Estado: {status_display}).\n"
+                                 f"La alerta ha sido creada/actualizada con objetivo {escaped_target_price}€ para:\n🔗 {url}")
+    else:
+        escaped_target_price = scraper_utils.escape_markdown_v2(str(target_price))
+        full_response_message = (f"{base_response_text}\n"
+                                 f"❓ Estado del producto desconocido o inesperado (Estado: {status_display}).\n"
+                                 f"Alerta creada/actualizada con objetivo {escaped_target_price}€ para:\n🔗 {url}")
+
     image_url = product_info.get("image")
     sent_with_photo = False
-    if image_url and image_url != "N/A (cache)" and product_info['status'] == "SCRAPED_SUCCESS":
+    if image_url and image_url != "N/A (cache)" and \
+       (raw_status == "CACHE_HIT" or
+        raw_status.startswith("SCRAPED_SUCCESS") or
+        raw_status.startswith("SCRAPED_INCOMPLETE")):
         try:
-            if processing_message: # Editar el mensaje "Procesando..." para que sea la foto
+            if processing_message:
                  await context.bot.delete_message(chat_id=chat_id, message_id=processing_message.message_id)
-                 # No se puede editar un mensaje de texto a foto, se envía uno nuevo.
+                 processing_message = None
+            
             await context.bot.send_photo(
                 chat_id=chat_id,
                 photo=image_url,
@@ -88,28 +124,40 @@ async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             sent_with_photo = True
         except TelegramError as e:
-            logger.warning(f"No se pudo enviar foto para /track ({image_url}): {e}. Enviando solo texto.")
-        except Exception as e_gen: # Captura otras excepciones por si acaso
-            logger.error(f"Error inesperado al intentar enviar foto para /track: {e_gen}", exc_info=True)
+            logger.warning(f"/track: No se pudo enviar foto para /track ({image_url}): {e}. Enviando solo texto.", exc_info=True)
+        except Exception as e_gen:
+            logger.error(f"/track: Error inesperado al intentar enviar foto para /track: {e_gen}", exc_info=True)
+    else:
+        logger.info(f"/track: No se intentará enviar foto. Image URL: {image_url}, Raw Status: {raw_status}")
 
 
-    if not sent_with_photo: # Si no se envió foto (o falló)
-        if processing_message:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=processing_message.message_id,
-                text=full_response_message,
-                parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            await update.message.reply_text(full_response_message, parse_mode=ParseMode.MARKDOWN)
-
+    if not sent_with_photo:
+        logger.info(f"/track: Enviando mensaje de solo texto.")
+        try:
+            if processing_message:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=processing_message.message_id,
+                    text=full_response_message,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                await update.message.reply_text(full_response_message, parse_mode=ParseMode.MARKDOWN)
+            logger.info(f"/track: Mensaje de texto enviado/editado exitosamente a chat {chat_id}")
+        except TelegramError as e:
+            logger.error(f"/track: TelegramError al enviar/editar mensaje de texto: {e}", exc_info=True)
+            try:
+                await update.message.reply_text("⚠️ Ocurrió un error al formatear la respuesta. Tu alerta ha sido procesada.")
+            except Exception as e_fallback:
+                logger.error(f"/track: Error en el mensaje de fallback: {e_fallback}", exc_info=True)
+        except Exception as e_gen:
+            logger.error(f"/track: Error inesperado al enviar/editar mensaje de texto: {e_gen}", exc_info=True)
 
 async def list_alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_alerts = await asyncio.to_thread(db_queries.get_user_alerts, chat_id)
     message_text, reply_markup = format_alert_list_message(user_alerts)
-    await update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN) # Ya estaba en MARKDOWN, se mantiene
 
 async def delete_alert_by_number_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -128,9 +176,7 @@ async def delete_alert_by_number_command(update: Update, context: ContextTypes.D
     alert_id_to_delete = str(alerts_ordered[idx_to_delete]['id'])
     deleted = await asyncio.to_thread(db_queries.delete_alert_by_id, alert_id_to_delete, chat_id)
     if deleted:
-        # Obtener nombre del producto para mensaje de confirmación (opcional)
-        # alert_name = alerts_ordered[idx_to_delete].get('product_name', 'la alerta seleccionada')
-        await update.message.reply_text(f"🗑️ Alerta eliminada.") # Podrías añadir `para {alert_name}`
+        await update.message.reply_text(f"🗑️ Alerta eliminada.")
     else:
         await update.message.reply_text("⚠️ No se pudo eliminar.")
 
@@ -152,15 +198,17 @@ async def handle_refresh_alert(update: Update, context: ContextTypes.DEFAULT_TYP
     if product_info.get("price") is not None:
         await asyncio.to_thread(db_queries.update_alert_last_price, alert_id_str, product_info["price"])
         feedback_msg_text, _ = format_product_info_message(product_info, alert_data['target_price'])
-        final_message = f"✅ Información actualizada para [{product_info.get('name', 'Producto')}]({alert_data['full_url']}):\n{feedback_msg_text}"
         
-        # Re-enviar la lista de alertas actualizada
+        product_name_for_link = product_info.get('name', 'Producto')
+        if not product_name_for_link or product_name_for_link == "N/A (cache)":
+            product_name_for_link = "Producto"
+
+        final_message = f"✅ Información actualizada para [{product_name_for_link}]({alert_data['full_url']}):\n{feedback_msg_text}"
+        
         user_alerts = await asyncio.to_thread(db_queries.get_user_alerts, chat_id)
         list_text, list_markup = format_alert_list_message(user_alerts)
 
-        # Primero editar el mensaje de "actualizando" para quitarlo
         await query.edit_message_text(text=final_message, parse_mode=ParseMode.MARKDOWN, reply_markup=None)
-        # Luego enviar la nueva lista (o editar el mensaje original de la lista si se pudiera identificar)
         await context.bot.send_message(chat_id=chat_id, text=list_text, reply_markup=list_markup, parse_mode=ParseMode.MARKDOWN)
 
     else:

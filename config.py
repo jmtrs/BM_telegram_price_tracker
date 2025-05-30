@@ -7,7 +7,6 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", 14400))
 NOTIFY_COOLDOWN_HOURS = float(os.getenv("NOTIFY_COOLDOWN_HOURS", 4))
@@ -34,5 +33,3 @@ if not TELEGRAM_TOKEN:
 if not DATABASE_URL:
     logger.critical("No se encontró DATABASE_URL en las variables de entorno.")
     raise ValueError("No se encontró DATABASE_URL en las variables de entorno.")
-if not SCRAPERAPI_KEY:
-    logger.warning("No se encontró SCRAPERAPI_KEY. El scraping podría no funcionar como se espera.")

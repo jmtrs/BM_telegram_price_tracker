@@ -29,36 +29,30 @@ def save_scraped_price(clean_url: str, product_details: dict):
     """Guarda o actualiza todos los detalles scrapeados del producto."""
     conn = get_db_connection()
     
-    # Crear un diccionario para los parámetros de la query,
-    # combinando clean_url con product_details.
     params_for_query = {
-        'clean_url': clean_url, # Añadir clean_url explícitamente
+        'clean_url': clean_url,
         'price': product_details.get('price'),
-        'condition': product_details.get('condition'), # Asegúrate que 'condition' es la clave correcta
-                                                     # en product_details, o usa 'product_condition'
-                                                     # si así lo devuelve _parse_product_details y lo
-                                                     # espera la tabla.
-                                                     # La tabla tiene 'product_condition'.
-                                                     # _parse_product_details devuelve 'condition'.
-                                                     # Vamos a estandarizar.
-        'product_condition': product_details.get('condition'), # Usar la clave que _parse devuelve
+        'product_condition': product_details.get('condition'),
         'name': product_details.get('name'),
         'description': product_details.get('description'),
-        'image_url': product_details.get('image'), # La columna es image_url, el detalle es 'image'
+        'image_url': product_details.get('image'),
         'color': product_details.get('color'),
         'storage': product_details.get('storage'),
-        'brand_name': product_details.get('brand_name')
+        'brand_name': product_details.get('brand_name'),
+        'availability': product_details.get('availability')
     }
 
     with conn.cursor() as cur:
         sql = """
             INSERT INTO scraped_prices (
                 clean_url, price, product_condition, scraped_at,
-                product_name, description, image_url, color, storage, brand_name
+                product_name, description, image_url, color, storage, brand_name,
+                availability  -- Añadir columna availability
             )
             VALUES (
                 %(clean_url)s, %(price)s, %(product_condition)s, now(),
-                %(name)s, %(description)s, %(image_url)s, %(color)s, %(storage)s, %(brand_name)s
+                %(name)s, %(description)s, %(image_url)s, %(color)s, %(storage)s, %(brand_name)s,
+                %(availability)s  -- Añadir valor para availability
             )
             ON CONFLICT (clean_url) DO UPDATE SET
                 price = EXCLUDED.price,
@@ -69,7 +63,8 @@ def save_scraped_price(clean_url: str, product_details: dict):
                 image_url = EXCLUDED.image_url,
                 color = EXCLUDED.color,
                 storage = EXCLUDED.storage,
-                brand_name = EXCLUDED.brand_name
+                brand_name = EXCLUDED.brand_name,
+                availability = EXCLUDED.availability  -- Actualizar availability en conflicto
         """
         cur.execute(sql, params_for_query)
     logger.info(f"Datos completos del producto guardados/actualizados para {clean_url}")
@@ -83,8 +78,6 @@ def cleanup_old_scraped_prices():
         deleted_count = cur.rowcount
     if deleted_count > 0:
         logger.info(f"Limpieza de caché: {deleted_count} registros eliminados.")
-    # else: # Loguear solo si algo se borró para reducir ruido
-    #     logger.info("Limpieza de caché: No hay registros antiguos que eliminar.")
     return deleted_count
 
 # --- Alerts Queries ---
@@ -95,7 +88,6 @@ def get_alert_by_chat_and_clean_url(chat_id: int, clean_url: str) -> dict | None
         cur.execute("SELECT * FROM alerts WHERE chat_id=%s AND clean_url=%s", (chat_id, clean_url))
         return cur.fetchone()
 
-# NUEVA FUNCIÓN para obtener una alerta por su ID
 def get_alert_by_id(alert_id: str) -> dict | None:
     """Obtiene una alerta específica por su ID (UUID como string)."""
     conn = get_db_connection()
@@ -115,7 +107,6 @@ def update_alert_target_price(alert_id: str, target_price: float, full_url: str)
 def create_alert(chat_id: int, full_url: str, clean_url: str, target_price: float, product_name: str | None = None):
     conn = get_db_connection()
     with conn.cursor() as cur:
-        # Podríamos considerar añadir product_name a la tabla alerts si queremos mostrarlo en /alerts sin joins
         cur.execute("""
             INSERT INTO alerts (chat_id, full_url, clean_url, target_price) 
             VALUES (%s, %s, %s, %s) RETURNING id
@@ -151,7 +142,6 @@ def get_all_alerts() -> list[dict]:
 def update_alert_last_price(alert_id: str, current_price: float | None):
     conn = get_db_connection()
     with conn.cursor() as cur:
-        # Si current_price es None, guardamos NULL en la BD
         cur.execute(
             "UPDATE alerts SET last_price=%s, inserted_at=now() WHERE id::text=%s",
             (current_price, alert_id)

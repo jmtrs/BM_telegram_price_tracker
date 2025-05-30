@@ -31,7 +31,6 @@ async def check_alerts_periodically(application: Application):
             logger.info(f"[Checker] Verificando {len(alerts_to_check)} alerta(s).")
 
         for i, alert_data in enumerate(alerts_to_check):
-            logger.debug(f"[Checker] Procesando alerta ID {alert_data['id']} para URL: {alert_data['clean_url']}")
             if i > 0: await asyncio.sleep(1)
 
             now_utc = datetime.utcnow()

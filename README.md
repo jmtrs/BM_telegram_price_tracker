@@ -33,7 +33,6 @@ This Telegram bot allows users to track product prices from URLs. It periodicall
     ```env
     TELEGRAM_TOKEN=your_telegram_bot_token_here
     DATABASE_URL=postgresql://user:password@host:port/database
-    SCRAPERAPI_KEY=your_scraperapi_key_here
 
     # Optional: Adjust these parameters if needed
     # CHECK_INTERVAL_SECONDS=14400  # 4 hours
@@ -91,7 +90,6 @@ Railway is a good platform for deploying applications like this. Here's a genera
     * In your Railway project settings, add the following environment variables:
         * `TELEGRAM_TOKEN`: Your Telegram bot token.
         * `DATABASE_URL`: Your PostgreSQL connection string.
-        * `SCRAPERAPI_KEY`: Your ScraperAPI key.
         * You can also add `CHECK_INTERVAL_SECONDS`, etc., if you modify the script to read them from the environment.
 5.  **Define a Start Command (Procfile):**
     Create a `Procfile` in the root of your repository with the following line:
