@@ -104,7 +104,7 @@ def _parse_product_details(html_content: str, url: str) -> dict:
         if isinstance(color_value_from_json_ld, str):
             product_data['color'] = color_value_from_json_ld.strip()
             source_parts.append("color_jsonld_direct")
-        elif color_value_from_json_ld: # Si existe pero no es string, loguear
+        elif color_value_from_json_ld:
             source_parts.append("color_jsonld_type_mismatch")
         else:
             source_parts.append("color_jsonld_not_found")
@@ -114,7 +114,7 @@ def _parse_product_details(html_content: str, url: str) -> dict:
         if isinstance(storage_value_from_json_ld, str):
             product_data['storage'] = storage_value_from_json_ld.strip()
             source_parts.append("storage_jsonld_direct")
-        elif storage_value_from_json_ld: # Si existe pero no es string, loguear
+        elif storage_value_from_json_ld:
             source_parts.append("storage_jsonld_type_mismatch")
         else:
             source_parts.append("storage_jsonld_not_found")
@@ -122,7 +122,7 @@ def _parse_product_details(html_content: str, url: str) -> dict:
         offers_data = product_json_ld.get('offers', {})
         if isinstance(offers_data, list): 
             offers_data = offers_data[0] if offers_data else {}
-        if not isinstance(offers_data, dict): # Asegurar que offers_data sea un dict para .get()
+        if not isinstance(offers_data, dict):
             offers_data = {}
 
         availability_raw_from_json_ld = offers_data.get('availability')
@@ -130,38 +130,38 @@ def _parse_product_details(html_content: str, url: str) -> dict:
         if availability_raw_from_json_ld and isinstance(availability_raw_from_json_ld, str):
             availability_lower = availability_raw_from_json_ld.lower()
             if "instock" in availability_lower:
-                normalized_availability = "En stock"
+                normalized_availability = "InStock"
                 source_parts.append("availability_jsonld_instock")
             elif "outofstock" in availability_lower:
-                normalized_availability = "Agotado"
+                normalized_availability = "OutOfStock"
                 source_parts.append("availability_jsonld_outofstock")
             elif "preorder" in availability_lower:
-                normalized_availability = "En preventa"
+                normalized_availability = "PreOrder"
                 source_parts.append("availability_jsonld_preorder")
             elif "soldout" in availability_lower:
-                normalized_availability = "Agotado"
+                normalized_availability = "SoldOut"
                 source_parts.append("availability_jsonld_soldout")
             elif "discontinued" in availability_lower:
-                normalized_availability = "Discontinuado"
+                normalized_availability = "Discontinued"
                 source_parts.append("availability_jsonld_discontinued")
             else: 
-                if "schema.org/" in availability_raw_from_json_ld: # Usar el término de schema.org si es una URL
+                if "schema.org/" in availability_raw_from_json_ld:
                     normalized_availability = availability_raw_from_json_ld.split('/')[-1]
-                else: # Usar el valor crudo si no es un término conocido ni URL de schema.org
+                else:
                     normalized_availability = availability_raw_from_json_ld
                 source_parts.append("availability_jsonld_other")
             product_data['availability'] = normalized_availability
-        elif availability_raw_from_json_ld: # Si no es string pero existe (ej. booleano, número)
+        elif availability_raw_from_json_ld:
             product_data['availability'] = str(availability_raw_from_json_ld) 
             source_parts.append("availability_jsonld_raw_type_unexpected")
-    else: # Si no se encontró product_json_ld
-        product_json_ld = {} # Asegurar que es un dict para evitar errores en .get() más adelante
-        offers_data = {}   # Asegurar que offers_data también es un dict
+    else:
+        product_json_ld = {}
+        offers_data = {}
 
     if name_from_html:
         product_data['name'] = name_from_html
         source_parts.append("name_html")
-    elif product_data['name']: # Si no hay nombre HTML pero sí de JSON-LD
+    elif product_data['name']:
         source_parts.append("name_jsonld")
 
     price_from_html = None
@@ -183,7 +183,7 @@ def _parse_product_details(html_content: str, url: str) -> dict:
                     logger.warning(f"No se pudo convertir precio HTML '{price_text_cleaned}' a float para {url}")
     
     price_from_json_ld = None
-    price_from_json_ld_str = offers_data.get('price') # offers_data ya está garantizado como dict
+    price_from_json_ld_str = offers_data.get('price')
     if price_from_json_ld_str:
         try:
             price_from_json_ld = float(price_from_json_ld_str)
@@ -239,7 +239,6 @@ def _parse_product_details(html_content: str, url: str) -> dict:
                 temp_raw_text = direct_text
             else:
                 # Si el texto directo no es una condición, buscar partes que sí lo sean
-                # Corregido: Usar r'\b' para que la regex interprete \b como word boundary correctamente.
                 parts = re.findall(r'\b[A-Za-záéíóúÁÉÍÓÚüÜñÑ]{3,}(?:\s+[A-Za-záéíóúÁÉÍÓÚüÜñÑ]{2,})?\b', direct_text)
                 for part in parts:
                     normalized_part_check = _normalize_condition(part)
@@ -251,7 +250,6 @@ def _parse_product_details(html_content: str, url: str) -> dict:
                             break 
                             
         if temp_raw_text:
-            # Verificación final: el texto extraído debe ser normalizable
             normalized_condition_check = _normalize_condition(temp_raw_text)
             if normalized_condition_check:
                 raw_grade_text_final = temp_raw_text
@@ -284,7 +282,7 @@ def _parse_product_details(html_content: str, url: str) -> dict:
     else:
         source_parts.append("condition_unavailable")
         
-    product_data['source'] = ",".join(list(dict.fromkeys(source_parts))) # Deduplicar fuentes manteniendo orden
+    product_data['source'] = ",".join(list(dict.fromkeys(source_parts)))
 
     return product_data
 
