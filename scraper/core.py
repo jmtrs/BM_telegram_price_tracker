@@ -412,12 +412,9 @@ async def get_product_info(url_to_scrape: str) -> dict:
         try:
             product_details = _parse_product_details(html_content, url_to_scrape)
             
-            # Actualizar la respuesta base con los detalles parseados
-            # Esto asegura que todos los campos estén presentes en la respuesta final
             final_details = base_response.copy()
             final_details.update(product_details)
 
-            # Verificar atributos clave después del parseo
             missing_attributes = [
                 key for key in ["price", "condition"]
                 if not final_details.get(key)
@@ -428,29 +425,26 @@ async def get_product_info(url_to_scrape: str) -> dict:
             else:
                 final_details["status"] = f"SCRAPED_SUCCESS_{fetch_status}"
             
-            # Guardar en BD (incluso si está incompleto, para análisis o reintentos manuales)
-            try:
-                await asyncio.to_thread(
-                    db_queries.save_scraped_price,
-                    cleaned_url_str,
-                    final_details # Guardar el diccionario completo y enriquecido
-                )
-            except Exception as e:
-                final_details["status"] += "_DB_SAVE_ERROR"
+            if not final_details["status"].startswith("SCRAPE_FAILED"):
+                try:
+                    await asyncio.to_thread(
+                        db_queries.save_scraped_price,
+                        cleaned_url_str,
+                        final_details
+                    )
+                except Exception as e:
+                    logger.error(f"Error al guardar datos scrapeados (éxito/incompleto) en BD para {cleaned_url_str}: {e}", exc_info=True)
+                    final_details["status"] += "_DB_SAVE_ERROR"
+            else:
+                logger.info(f"No se guardan datos para {cleaned_url_str} porque el estado es {final_details['status']}")
 
             return final_details
         except Exception as e:
+            logger.error(f"Error al parsear HTML para {url_to_scrape} ({fetch_status}): {e}", exc_info=True)
             base_response["status"] = f"SCRAPE_FAILED_PARSE_ERROR_{fetch_status}"
-            # Intentar guardar lo que se tenga (URL y estado de fallo de parseo)
-            try:
-                await asyncio.to_thread(db_queries.save_scraped_price, cleaned_url_str, base_response)
-            except Exception as db_e:
-                logger.error(f"Error al guardar fallo de parseo en BD para {cleaned_url_str}: {db_e}", exc_info=True)
+            logger.warning(f"No se guardarán datos para {cleaned_url_str} debido a error de parseo, estado: {base_response['status']}")
             return base_response
-    else: # fetch_status no fue 'SUCCESS' o html_content es None
-        try:
-            await asyncio.to_thread(db_queries.save_scraped_price, cleaned_url_str, base_response)
-        except Exception as db_e:
-            logger.error(f"Error al guardar fallo de obtención de HTML en BD para {cleaned_url_str}: {db_e}", exc_info=True)
+    else:
+        logger.warning(f"No se guardarán datos para {cleaned_url_str} debido a fallo en obtención de HTML, estado: {base_response['status']}")
         return base_response
 

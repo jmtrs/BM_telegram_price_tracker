@@ -70,11 +70,10 @@ async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         product_price_check = product_info.get('price')
 
         if raw_status_check.startswith("SCRAPE_FAILED"):
-            logger.warning(f"/track: Scraping falló para URL {url} con estado {raw_status_check}. No se creará/actualizará la alerta.")
             await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=processing_message.message_id,
-                text=f"❌ No se pudo obtener información del producto desde la URL proporcionada (Estado: {raw_status_check}). La alerta no ha sido creada/actualizada."
+                text=f"❌ No se pudo obtener información del producto desde la URL proporcionada. La alerta no ha sido creada/actualizada."
             )
             return
 
@@ -122,10 +121,6 @@ async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif raw_status.startswith("SCRAPED_INCOMPLETE"):
         full_response_message = (f"{base_response_text}\n{message_text_body}\n"
                                  f"⚠️ _Algunos detalles del producto no pudieron ser obtenidos (Estado: {status_display})_")
-    elif raw_status.startswith("SCRAPE_FAILED"):
-        full_response_message = (f"{base_response_text}\n"
-                                 f"⚠️ No se pudo obtener la información completa del producto (Estado: {status_display}).\n"
-                                 f"La alerta ha sido creada/actualizada con objetivo {str(target_price)}€ para:\n🔗 {url}")
     else:
         full_response_message = (f"{base_response_text}\n"
                                  f"❓ Estado del producto desconocido o inesperado (Estado: {status_display}).\n"
