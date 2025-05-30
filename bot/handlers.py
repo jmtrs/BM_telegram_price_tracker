@@ -95,15 +95,13 @@ async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         full_response_message = (f"{base_response_text}\n{message_text_body}\n"
                                  f"⚠️ _Algunos detalles del producto no pudieron ser obtenidos (Estado: {status_display})_")
     elif raw_status.startswith("SCRAPE_FAILED"):
-        escaped_target_price = scraper_utils.escape_markdown_v2(str(target_price))
         full_response_message = (f"{base_response_text}\n"
                                  f"⚠️ No se pudo obtener la información completa del producto (Estado: {status_display}).\n"
-                                 f"La alerta ha sido creada/actualizada con objetivo {escaped_target_price}€ para:\n🔗 {url}")
+                                 f"La alerta ha sido creada/actualizada con objetivo {str(target_price)}€ para:\n🔗 {url}")
     else:
-        escaped_target_price = scraper_utils.escape_markdown_v2(str(target_price))
         full_response_message = (f"{base_response_text}\n"
                                  f"❓ Estado del producto desconocido o inesperado (Estado: {status_display}).\n"
-                                 f"Alerta creada/actualizada con objetivo {escaped_target_price}€ para:\n🔗 {url}")
+                                 f"Alerta creada/actualizada con objetivo {str(target_price)}€ para:\n🔗 {url}")
 
     image_url = product_info.get("image")
     sent_with_photo = False
