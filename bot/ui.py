@@ -32,7 +32,7 @@ def format_product_info_message(product_info: dict, target_price: float | None =
     availability_value = product_info.get("availability")
     if availability_value and availability_value != "N/A (cache)":
         status_text = "✅ En stock" if availability_value.lower() == "instock" else "❌ Sin stock"
-        msg_parts.append(f"📦 Disponibilidad: {status_text}") # Sin escape
+        msg_parts.append(f"📦 Disponibilidad: {status_text}")
     
     condition_value = product_info.get("condition") or product_info.get("product_condition")
     if condition_value and condition_value != "N/A (cache)":
@@ -53,27 +53,34 @@ def format_product_info_message(product_info: dict, target_price: float | None =
     return "\n".join(msg_parts), reply_markup
 
 
-def format_alert_list_message(alerts: list[dict]) -> tuple[str, InlineKeyboardMarkup | None]:
+def format_alert_list_message(alerts: list[dict], sort_by: str = "date_desc") -> tuple[str, InlineKeyboardMarkup | None]:
     if not alerts:
         return "📭 No tienes alertas activas.", None
 
-    main_text_parts = ["📌 Tus alertas activas (más recientes/actualizadas primero):"]
-    keyboard_layout = []
+    sort_criteria_text = {
+        "date_desc": "Más recientes primero",
+        "price_asc": "Precio actual (ascendente)"
+    }
+    current_sort_text = sort_criteria_text.get(sort_by, "Desconocido")
+
+    main_text_parts = [f"📌 Tus alertas activas (Orden: {current_sort_text}):"]
 
     for i, alert_data in enumerate(alerts):
-        full_url = alert_data.get('full_url', '')
-        alert_id_str = str(alert_data['id'])
         item_number = i + 1
+        alert_id = alert_data.get("id")
         
-        link_text_display = full_url 
-        if len(link_text_display) > 40:
-            link_text_display = link_text_display[:37] + "..."
-        
-        line = f"\n{item_number}. "
-        if full_url:
-            line += f"[{link_text_display if link_text_display else 'Producto'}]({full_url})"
-        else:
-            line += "URL Desconocida"
+        product_name = alert_data.get('product_name', 'Producto Desconocido')
+        if not product_name or product_name == "N/A (cache)":
+            product_name = "Producto (nombre no disponible)"
+
+        line = f"\n{item_number}. *{product_name}*"
+        if alert_id:
+            line += f" (ID: `{alert_id}`)"
+
+
+        product_condition = alert_data.get('product_condition')
+        if product_condition and product_condition != "N/A (cache)":
+            line += f"\n    ✨ Condición: {product_condition}"
             
         target_price_str = str(alert_data['target_price'])
         line += f"\n    🎯 Objetivo: ≤{target_price_str}€" 
@@ -83,16 +90,23 @@ def format_alert_list_message(alerts: list[dict]) -> tuple[str, InlineKeyboardMa
             last_price_str = str(last_price_val)
             line += f" (Último: {last_price_str}€)"
         else:
-            line += f" (Aún no verificado)"
+            line += " (Aún no verificado)"
+        
+        full_url = alert_data.get('full_url', '')
+        if full_url:
+            line += f"\n    🔗 [Ver producto]({full_url})"
         
         main_text_parts.append(line)
         
-        buttons_for_alert = [
-            InlineKeyboardButton(f"🗑️ Eliminar {item_number}", callback_data=f"delete_alert_{alert_id_str}")
+    # Botones de ordenación
+    keyboard_layout = [
+        [
+            InlineKeyboardButton("Ordenar por Precio Actual (asc)", callback_data="sort_alerts_price_asc"),
+            InlineKeyboardButton("Ordenar por Fecha (recientes)", callback_data="sort_alerts_date_desc")
         ]
-        keyboard_layout.append(buttons_for_alert)
+    ]
     
-    reply_markup = InlineKeyboardMarkup(keyboard_layout) if keyboard_layout else None
+    reply_markup = InlineKeyboardMarkup(keyboard_layout)
     return "\n".join(main_text_parts), reply_markup
 
 def format_notification_content(alert_data: dict, product_info: dict) -> tuple[str, InlineKeyboardMarkup | None, str | None]:

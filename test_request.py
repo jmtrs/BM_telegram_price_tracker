@@ -209,17 +209,11 @@ def _parse_product_details(html_content: str, url: str) -> dict:
         logger.info(f"COND_HTML: No se obtuvo ningún texto de grado crudo de HTML.")
 
     # Condition from JSON-LD (fallback)
-    # Asegurarse de que offers_data es un diccionario antes de usar .get() (ya se hizo para el precio, se aplica también aquí)
     condition_from_json_ld_schema = offers_data.get('itemCondition')
     normalized_json_ld_condition = None
     if condition_from_json_ld_schema:
         raw_condition_str = str(condition_from_json_ld_schema).split('/')[-1] if "schema.org/" in str(condition_from_json_ld_schema) else str(condition_from_json_ld_schema)
         normalized_json_ld_condition = _normalize_condition(raw_condition_str)
-        if normalized_json_ld_condition:
-             logger.info(f"Condición JSON-LD normalizada: '{normalized_json_ld_condition}' (raw: '{raw_condition_str}')")
-        else:
-             logger.warning(f"Condición JSON-LD '{raw_condition_str}' no pudo ser normalizada para {url}.")
-
 
     if grade_condition_from_html:
         product_data['condition'] = grade_condition_from_html

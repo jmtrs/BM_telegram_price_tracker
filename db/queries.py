@@ -10,24 +10,37 @@ logger = logging.getLogger(__name__)
 
 def get_cached_price(clean_url: str) -> dict | None:
     conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT price, product_condition, scraped_at,
-                   product_name, description, image_url,
-                   color, storage, brand_name
-            FROM scraped_prices
-            WHERE clean_url = %s
-            ORDER BY scraped_at DESC LIMIT 1
-        """, (clean_url,))
-        row = cur.fetchone()
-    if row and datetime.utcnow() - row['scraped_at'] < timedelta(minutes=config.SCRAPE_TTL_MINUTES):
-        logger.info(f"Usando datos completos de caché para {clean_url}")
-        return dict(row)
-    return None
+    if not conn:
+        logger.error("Failed to get DB connection in get_cached_price")
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT price, product_condition, scraped_at,
+                       product_name, description, image_url,
+                       color, storage, brand_name
+                FROM scraped_prices
+                WHERE clean_url = %s
+                ORDER BY scraped_at DESC LIMIT 1
+            """, (clean_url,))
+            row = cur.fetchone()
+        if row and datetime.utcnow() - row['scraped_at'] < timedelta(minutes=config.SCRAPE_TTL_MINUTES):
+            logger.info(f"Usando datos completos de caché para {clean_url}")
+            return dict(row)
+        return None
+    except Exception as e:
+        logger.error(f"Error in get_cached_price for {clean_url}: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
 
 def save_scraped_price(clean_url: str, product_details: dict):
     """Guarda o actualiza todos los detalles scrapeados del producto."""
     conn = get_db_connection()
+    if not conn:
+        logger.error("Failed to get DB connection in save_scraped_price")
+        return
     
     params_for_query = {
         'clean_url': clean_url,
@@ -42,8 +55,9 @@ def save_scraped_price(clean_url: str, product_details: dict):
         'availability': product_details.get('availability')
     }
 
-    with conn.cursor() as cur:
-        sql = """
+    try:
+        with conn.cursor() as cur:
+            sql = """
             INSERT INTO scraped_prices (
                 clean_url, price, product_condition, scraped_at,
                 product_name, description, image_url, color, storage, brand_name,
@@ -65,15 +79,21 @@ def save_scraped_price(clean_url: str, product_details: dict):
                 storage = EXCLUDED.storage,
                 brand_name = EXCLUDED.brand_name,
                 availability = EXCLUDED.availability  -- Actualizar availability en conflicto
-        """
-        cur.execute(sql, params_for_query)
-    logger.info(f"Datos completos del producto guardados/actualizados para {clean_url}")
-
+            """
+            cur.execute(sql, params_for_query)
+        conn.commit()
+        logger.info(f"Datos completos del producto guardados/actualizados para {clean_url}")
+    except Exception as e:
+        logger.error(f"Error in save_scraped_price for {clean_url}: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
 
 def cleanup_old_scraped_prices():
     conn = get_db_connection()
     with conn.cursor() as cur:
-        # El intervalo para limpieza podría ir a config.py
         cur.execute("DELETE FROM scraped_prices WHERE scraped_at < now() - interval '2 days'")
         deleted_count = cur.rowcount
     if deleted_count > 0:
@@ -82,72 +102,242 @@ def cleanup_old_scraped_prices():
 
 # --- Alerts Queries ---
 
-def get_alert_by_chat_and_clean_url(chat_id: int, clean_url: str) -> dict | None: # Renombrado
+def get_alert_by_chat_and_clean_url(chat_id: int, clean_url: str) -> dict | None:
     conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM alerts WHERE chat_id=%s AND clean_url=%s", (chat_id, clean_url))
-        return cur.fetchone()
+    if not conn:
+        logger.error("Failed to get DB connection in get_alert_by_chat_and_clean_url")
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM alerts WHERE chat_id=%s AND clean_url=%s", (chat_id, clean_url))
+            return cur.fetchone()
+    except Exception as e:
+        logger.error(f"Error in get_alert_by_chat_and_clean_url for chat {chat_id}, url {clean_url}: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
 
 def get_alert_by_id(alert_id: str) -> dict | None:
     """Obtiene una alerta específica por su ID (UUID como string)."""
     conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM alerts WHERE id::text = %s", (alert_id,))
-        return cur.fetchone()
+    if not conn:
+        logger.error(f"Failed to get DB connection in get_alert_by_id for alert {alert_id}")
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM alerts WHERE id::text = %s", (alert_id,))
+            return cur.fetchone()
+    except Exception as e:
+        logger.error(f"Error in get_alert_by_id for alert {alert_id}: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
 
 def update_alert_target_price(alert_id: str, target_price: float, full_url: str): # Renombrado
     conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE alerts SET target_price=%s, inserted_at=now(), full_url=%s WHERE id::text=%s",
-            (target_price, full_url, alert_id)
-        )
-    logger.info(f"Alerta {alert_id} actualizada. Nuevo objetivo: {target_price}€")
+    if not conn:
+        logger.error("Failed to get DB connection in update_alert_target_price")
+        raise Exception("Database connection failed")
+    try:
+        rows_affected = 0
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE alerts SET target_price=%s, inserted_at=now(), full_url=%s WHERE id::text=%s",
+                (target_price, full_url, alert_id)
+            )
+            rows_affected = cur.rowcount
+        conn.commit()
+        if rows_affected > 0:
+            logger.info(f"Alerta {alert_id} actualizada. Nuevo objetivo: {target_price}€")
+        else:
+            logger.warning(f"Alerta {alert_id} no encontrada o no actualizada en update_alert_target_price.")
+    except Exception as e:
+        logger.error(f"Error in update_alert_target_price for alert {alert_id}: {e}")
+        if conn:
+            conn.rollback()
+        raise # Re-raise the exception
+    finally:
+        if conn:
+            conn.close()
 
 def create_alert(chat_id: int, full_url: str, clean_url: str, target_price: float, product_name: str | None = None):
     conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO alerts (chat_id, full_url, clean_url, target_price) 
-            VALUES (%s, %s, %s, %s) RETURNING id
-        """, (chat_id, full_url, clean_url, target_price))
-        new_alert_id = cur.fetchone()['id']
-    logger.info(f"Nueva alerta ID {new_alert_id} creada para chat_id {chat_id}, URL: {clean_url}, Objetivo: {target_price}€")
-    return new_alert_id
+    if not conn:
+        logger.error("Failed to get DB connection in create_alert")
+        raise Exception("Database connection failed") 
+    new_alert_id = None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO alerts (chat_id, full_url, clean_url, target_price) 
+                VALUES (%s, %s, %s, %s) RETURNING id
+            """, (chat_id, full_url, clean_url, target_price))
+            result = cur.fetchone()
+            if result:
+                new_alert_id = result['id']
+            else:
+                raise Exception("Failed to retrieve ID after insert in create_alert")
+        conn.commit()
+        if new_alert_id:
+            logger.info(f"Nueva alerta ID {new_alert_id} creada para chat_id {chat_id}, URL: {clean_url}, Objetivo: {target_price}€")
+        return new_alert_id
+    except Exception as e:
+        logger.error(f"Error in create_alert for chat {chat_id}, url {clean_url}: {e}")
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if conn:
+            conn.close()
 
-
-def get_user_alerts(chat_id: int) -> list[dict]:
+def get_user_alerts(chat_id: int, sort_by: str = "date_desc") -> list[dict]:
     conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM alerts WHERE chat_id=%s ORDER BY inserted_at DESC", (chat_id,))
-        return cur.fetchall()
+    if not conn:
+        logger.error(f"Failed to get DB connection in get_user_alerts for chat {chat_id}")
+        return [] # Return empty list on connection failure
+    try:
+        with conn.cursor() as cur:
+            sql_base = """
+                SELECT 
+                    a.*, 
+                    sp.product_name, 
+                    sp.product_condition
+                FROM alerts a
+                LEFT JOIN (
+                    SELECT 
+                        clean_url, 
+                        product_name, 
+                        product_condition, 
+                        ROW_NUMBER() OVER(PARTITION BY clean_url ORDER BY scraped_at DESC) as rn
+                    FROM scraped_prices
+                ) sp ON a.clean_url = sp.clean_url AND sp.rn = 1
+                WHERE a.chat_id = %s
+            """
+
+            if sort_by == "price_asc":
+                sql_query = sql_base + " ORDER BY a.last_price ASC NULLS LAST, a.inserted_at DESC"
+            else:
+                sql_query = sql_base + " ORDER BY a.inserted_at DESC"
+                
+            cur.execute(sql_query, (chat_id,))
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"Error in get_user_alerts for chat {chat_id}: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
 
 def delete_alert_by_id(alert_id: str, chat_id: int) -> bool:
     conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM alerts WHERE id::text=%s AND chat_id=%s RETURNING id", (alert_id, chat_id))
-        deleted_row = cur.fetchone()
-    if deleted_row:
-        logger.info(f"Alerta {alert_id} eliminada para chat_id {chat_id}.")
-        return True
-    logger.warning(f"Intento de eliminar alerta {alert_id} (chat_id {chat_id}) fallido.")
-    return False
+    if not conn:
+        logger.error("Failed to get DB connection in delete_alert_by_id")
+        return False
+    deleted = False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM alerts WHERE id::text=%s AND chat_id=%s RETURNING id", (alert_id, chat_id))
+            deleted_row = cur.fetchone()
+        conn.commit()
+        if deleted_row:
+            logger.info(f"Alerta {alert_id} eliminada para chat_id {chat_id}.")
+            deleted = True
+        else:
+            logger.warning(f"Intento de eliminar alerta {alert_id} (chat_id {chat_id}) fallido (no encontrada o no pertenece)." )
+    except Exception as e:
+        logger.error(f"Error in delete_alert_by_id for alert {alert_id}, chat {chat_id}: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
+    return deleted
 
 def get_all_alerts() -> list[dict]:
     conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM alerts")
-        return cur.fetchall()
+    if not conn:
+        logger.error("Failed to get DB connection in get_all_alerts")
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM alerts")
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"Error in get_all_alerts: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+def update_alert_target_price_by_id(alert_id: str, new_target_price: float, chat_id: int) -> bool:
+    """
+    Actualiza el precio objetivo de una alerta por su ID y chat_id.
+    """
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE alerts
+                SET target_price = %s, inserted_at = CURRENT_TIMESTAMP
+                WHERE id = %s AND chat_id = %s
+                RETURNING id;
+                """,
+                (new_target_price, alert_id, chat_id)
+            )
+            updated_alert = cur.fetchone()
+            conn.commit()
+            if updated_alert:
+                return True
+            else:
+                logger.warning(f"Alert {alert_id} not found or does not belong to chat {chat_id} for price update.")
+                return False
+    except Exception as e:
+        logger.error(f"Error updating alert target price by ID {alert_id} for chat {chat_id}: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
 
 def update_alert_last_price(alert_id: str, current_price: float | None):
     conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE alerts SET last_price=%s, inserted_at=now() WHERE id::text=%s",
-            (current_price, alert_id)
-        )
+    if not conn:
+        logger.error("Failed to get DB connection in update_alert_last_price")
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE alerts SET last_price=%s WHERE id::text=%s",
+                (current_price, alert_id)
+            )
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Error in update_alert_last_price for alert {alert_id}: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
 
 def update_alert_last_notified(alert_id: str):
     conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("UPDATE alerts SET last_notified=now() WHERE id::text=%s", (alert_id,))
+    if not conn:
+        logger.error("Failed to get DB connection in update_alert_last_notified")
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE alerts SET last_notified=now() WHERE id::text=%s", (alert_id,))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Error in update_alert_last_notified for alert {alert_id}: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()

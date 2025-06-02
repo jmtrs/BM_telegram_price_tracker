@@ -292,8 +292,7 @@ async def get_html_from_url(url: str, timeout_seconds: int = config.API_TIMEOUT_
     browser = None
     context = None
     page = None
-    effective_timeout_ms = timeout_seconds * 1000
-    
+
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
@@ -301,44 +300,39 @@ async def get_html_from_url(url: str, timeout_seconds: int = config.API_TIMEOUT_
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
             )
             page = await context.new_page()
-            
-            response = await page.goto(url, timeout=effective_timeout_ms, wait_until='domcontentloaded')
 
-            if response and response.ok:
-                html_content = await page.content()
-                return html_content
-            elif response:
-                logger.error(f"Error al obtener HTML de {url}. Status: {response.status} {response.status_text}")
-            else: # No response object
-                logger.error(f"No se recibió respuesta HTTP válida de {url}.")
-            return None # Explicitly return None on failure within try block
-                
+            await page.goto(url, timeout=timeout_seconds * 1000, wait_until='domcontentloaded')
+            
+            html_content = await page.content()
+
+            if not html_content or html_content.strip() == "<html><head></head><body></body></html>":
+                logger.warning(f"Contenido HTML vacío o mínimo para {url}")
+                return None
+            return html_content
     except PlaywrightTimeoutError:
         logger.error(f"Timeout ({timeout_seconds}s) al obtener HTML para {url}")
         return None
     except Exception as e:
-        logger.error(f"Error general al obtener HTML de {url} con Playwright: {e}", exc_info=True)
+        logger.error(f"Error general de Playwright/red al obtener HTML para {url}: {e}", exc_info=True)
         return None
     finally:
-        # Cerrar recursos de Playwright en orden inverso a su creación
-        if page and not page.is_closed():
+        if page:
             try:
                 await page.close()
             except Exception as e:
-                logger.warning(f"Excepción al cerrar la página de Playwright para {url}: {e}")
-        if context: # No hay método is_closed() estándar para context, intentar cerrar siempre
+                logger.warning(f"Error al cerrar página Playwright para {url}: {e}", exc_info=False)
+        if context:
             try:
                 await context.close()
             except Exception as e:
-                if "Target page, context or browser has been closed" in str(e) or "context.close: Target closed" in str(e):
-                    logger.warning(f"Contexto de Playwright para {url} ya estaba cerrado: {e}")
-                else:
-                    logger.error(f"Error al cerrar el contexto de Playwright para {url}: {e}", exc_info=False)
-        if browser and browser.is_connected():
+                logger.warning(f"Error al cerrar contexto Playwright para {url}: {e}", exc_info=False)
+        if browser:
             try:
                 await browser.close()
             except Exception as e:
-                logger.error(f"Error al cerrar el navegador de Playwright para {url}: {e}", exc_info=False)
+                logger.warning(f"Error al cerrar navegador Playwright para {url}: {e}", exc_info=False)
+        logger.debug(f"Recursos de Playwright para {url} (intentaron ser) cerrados.")
+
 
 async def fetch_product_details_from_url(full_url: str) -> tuple[str | None, str | None]:
     """

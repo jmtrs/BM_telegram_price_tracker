@@ -1,11 +1,12 @@
 # bot/handlers.py
 import logging
 import asyncio
-from urllib.parse import urlsplit # Añadir urlsplit
-from telegram import Update, InputMediaPhoto
+from urllib.parse import urlsplit
+from telegram import Update, InputMediaPhoto, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
+from uuid import UUID
 
 from db import queries as db_queries
 from scraper import core as scraper_core
@@ -18,29 +19,56 @@ from .ui import (
 
 logger = logging.getLogger(__name__)
 
+MAX_MESSAGE_LENGTH = 4096  # Límite de caracteres de Telegram por mensaje
+
+async def _send_message_potentially_chunked(bot, chat_id: int, text_content: str, reply_markup: InlineKeyboardMarkup | None = None):
+    """Envía un mensaje, dividiéndolo en fragmentos si excede la longitud máxima."""
+    if len(text_content) <= MAX_MESSAGE_LENGTH:
+        await bot.send_message(chat_id, text_content, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+    else:
+        lines = text_content.split('\n')
+        chunks = []
+        current_chunk = ""
+        for line in lines:
+            potential_length = len(current_chunk) + len(line) + (1 if current_chunk else 0)
+            if potential_length > MAX_MESSAGE_LENGTH and current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = line
+            else:
+                if current_chunk:
+                    current_chunk += "\n" + line
+                else:
+                    current_chunk = line
+        
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        for i, chunk in enumerate(chunks):
+            is_last_chunk = (i == len(chunks) - 1)
+            try:
+                await bot.send_message(
+                    chat_id,
+                    chunk, 
+                    reply_markup=reply_markup if is_last_chunk else None, 
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except TelegramError as e:
+                logger.error(f"Error al enviar chunk {i+1}/{len(chunks)} para chat {chat_id}: {e}")
+                if i == 0:
+                     await bot.send_message(chat_id, "❌ Error al mostrar las alertas: el mensaje es demasiado extenso y no se pudo dividir correctamente.")
+                break 
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_MESSAGE_MARKDOWN, parse_mode=ParseMode.MARKDOWN)
 
 async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Comando /track recibido con args: {context.args}")
     chat_id = update.effective_chat.id
     if not context.args or len(context.args) != 2:
         logger.warning(f"/track: Argumentos inválidos: {context.args}")
-        await update.message.reply_text("❌ Uso: /track <URL> <precio_objetivo>")
+        await update.message.reply_text("❌ Uso: /track <URL o ID_Alerta> <precio_objetivo>")
         return
-    url, price_str = context.args
-
-    # Validación del dominio de la URL
-    try:
-        parsed_url = urlsplit(url)
-        if parsed_url.netloc.lower() != "www.backmarket.es":
-            logger.warning(f"/track: URL no pertenece a www.backmarket.es: {url}")
-            await update.message.reply_text("❌ Solo se admiten URLs de www.backmarket.es")
-            return
-    except Exception as e:
-        logger.warning(f"/track: Error al parsear la URL para validación de dominio: {url}, error: {e}")
-        await update.message.reply_text("❌ URL inválida.")
-        return
+    
+    first_arg, price_str = context.args
 
     try:
         target_price = float(price_str)
@@ -52,11 +80,55 @@ async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"/track: Precio objetivo no es un número: {price_str}")
         await update.message.reply_text("❌ El precio objetivo debe ser un número.")
         return
+
+    # Intentar interpretar el primer argumento como UUID (ID de alerta)
+    try:
+        alert_uuid = UUID(first_arg)
+        processing_message = await update.message.reply_text(f"⚙️ Actualizando alerta ID {str(alert_uuid)[:8]}...")
+        
+        updated_count = await asyncio.to_thread(
+            db_queries.update_alert_target_price_by_id, 
+            str(alert_uuid), 
+            target_price,
+            chat_id
+        )
+
+        if updated_count and updated_count > 0:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=processing_message.message_id,
+                text=f"✅ Alerta ID {str(alert_uuid)[:8]} actualizada. Nuevo precio objetivo: {target_price}€."
+            )
+            logger.info(f"/track: Alerta {alert_uuid} actualizada para chat {chat_id} con nuevo precio {target_price}")
+        else:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=processing_message.message_id,
+                text=f"❌ No se encontró una alerta con ID {str(alert_uuid)[:8]} o no te pertenece."
+            )
+            logger.warning(f"/track: Intento de actualizar alerta inexistente o no perteneciente {alert_uuid} para chat {chat_id}")
+        return
+    except ValueError:
+        # No es un UUID, asumimos que es una URL y continuamos con la lógica original
+        logger.info(f"/track: El primer argumento no es un UUID, se tratará como URL: {first_arg}")
+        url = first_arg
     
     cleaned_url = scraper_utils.clean_url(url)
     if not cleaned_url:
         logger.warning(f"/track: URL inválida o no se pudo procesar: {url}")
         await update.message.reply_text("❌ URL inválida o no se pudo procesar.")
+        return
+
+    # Validación del dominio de la URL (solo si no era un UUID)
+    try:
+        parsed_url = urlsplit(url)
+        if parsed_url.netloc.lower() != "www.backmarket.es":
+            logger.warning(f"/track: URL no pertenece a www.backmarket.es: {url}")
+            await update.message.reply_text("❌ Solo se admiten URLs de www.backmarket.es")
+            return
+    except Exception as e:
+        logger.warning(f"/track: Error al parsear la URL para validación de dominio: {url}, error: {e}")
+        await update.message.reply_text("❌ URL inválida.")
         return
 
     processing_message = await update.message.reply_text("⚙️ Procesando tu solicitud...")
@@ -176,9 +248,12 @@ async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def list_alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    user_alerts = await asyncio.to_thread(db_queries.get_user_alerts, chat_id)
-    message_text, reply_markup = format_alert_list_message(user_alerts)
-    await update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN) # Ya estaba en MARKDOWN, se mantiene
+    sort_by = context.user_data.get('alert_sort_preference', 'date_desc')
+    
+    user_alerts = await asyncio.to_thread(db_queries.get_user_alerts, chat_id, sort_by)
+    message_text, reply_markup = format_alert_list_message(user_alerts, sort_by=sort_by)
+
+    await _send_message_potentially_chunked(context.bot, chat_id, message_text, reply_markup)
 
 async def delete_alert_by_number_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -190,20 +265,22 @@ async def delete_alert_by_number_command(update: Update, context: ContextTypes.D
     except ValueError:
         await update.message.reply_text("❌ El número debe ser un entero.")
         return
-    alerts_ordered = await asyncio.to_thread(db_queries.get_user_alerts, chat_id)
+
+    sort_by = context.user_data.get('alert_sort_preference', 'date_desc')
+    alerts_ordered = await asyncio.to_thread(db_queries.get_user_alerts, chat_id, sort_by)
+
     if not (0 <= idx_to_delete < len(alerts_ordered)):
         await update.message.reply_text("❌ Número de alerta inválido.")
         return
     alert_id_to_delete = str(alerts_ordered[idx_to_delete]['id'])
     deleted = await asyncio.to_thread(db_queries.delete_alert_by_id, alert_id_to_delete, chat_id)
     if deleted:
-        await update.message.reply_text(f"🗑️ Alerta eliminada.")
+        await update.message.reply_text("🗑️ Alerta eliminada.")
     else:
         await update.message.reply_text("⚠️ No se pudo eliminar.")
 
 
 async def handle_refresh_alert(update: Update, context: ContextTypes.DEFAULT_TYPE, alert_id_str: str):
-    """Maneja la acción de refrescar una alerta específica."""
     query = update.callback_query
     chat_id = query.message.chat_id
     
@@ -226,8 +303,9 @@ async def handle_refresh_alert(update: Update, context: ContextTypes.DEFAULT_TYP
 
         final_message = f"✅ Información actualizada para [{product_name_for_link}]({alert_data['full_url']}):\n{feedback_msg_text}"
         
-        user_alerts = await asyncio.to_thread(db_queries.get_user_alerts, chat_id)
-        list_text, list_markup = format_alert_list_message(user_alerts)
+        sort_by = context.user_data.get('alert_sort_preference', 'date_desc')
+        user_alerts = await asyncio.to_thread(db_queries.get_user_alerts, chat_id, sort_by)
+        list_text, list_markup = format_alert_list_message(user_alerts, sort_by=sort_by)
 
         await query.edit_message_text(text=final_message, parse_mode=ParseMode.MARKDOWN, reply_markup=None)
         await context.bot.send_message(chat_id=chat_id, text=list_text, reply_markup=list_markup, parse_mode=ParseMode.MARKDOWN)
@@ -241,6 +319,42 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     action_data = query.data
     chat_id = query.message.chat_id
+    message_id = query.message.message_id 
+
+    new_sort_by = None
+    if action_data == "sort_alerts_price_asc":
+        new_sort_by = "price_asc"
+        context.user_data['alert_sort_preference'] = new_sort_by
+        logger.info(f"Callback: Usuario {chat_id} cambió ordenación a 'price_asc'")
+    elif action_data == "sort_alerts_date_desc":
+        new_sort_by = "date_desc"
+        context.user_data['alert_sort_preference'] = new_sort_by
+        logger.info(f"Callback: Usuario {chat_id} cambió ordenación a 'date_desc'")
+
+    if new_sort_by:
+        user_alerts = await asyncio.to_thread(db_queries.get_user_alerts, chat_id, new_sort_by)
+        new_message_text, new_reply_markup = format_alert_list_message(user_alerts, sort_by=new_sort_by)
+
+        if len(new_message_text) > MAX_MESSAGE_LENGTH:
+            try:
+                await query.delete_message()
+            except TelegramError as e:
+                logger.error(f"Error al eliminar mensaje original antes de reenviar lista reordenada: {e}")
+            await _send_message_potentially_chunked(context.bot, chat_id, new_message_text, new_reply_markup)
+        else:
+            try:
+                await query.edit_message_text(
+                    text=new_message_text,
+                    reply_markup=new_reply_markup,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except TelegramError as e:
+                logger.error(f"Error al editar mensaje para cambio de ordenación: {e}")
+                if "Message is not modified" in str(e).lower():
+                    await query.answer("ℹ️ La lista ya está ordenada de esta manera.")
+                elif "message_too_long" not in str(e).lower(): 
+                    await query.answer("⚠️ Error al actualizar la lista.")
+        return
 
     if action_data.startswith("delete_alert_"):
         try:
@@ -252,7 +366,16 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         
         deleted = await asyncio.to_thread(db_queries.delete_alert_by_id, alert_id_str, chat_id)
         if deleted:
-            await query.edit_message_text(text="🗑️ Alerta eliminada.")
-            # Actualizar la lista de alertas después de eliminar
-            user_alerts = await asyncio.to_thread(db_queries.get_user_alerts, chat_id)
-            message_text, reply_markup = format_alert_list_message(user_alerts)
+            await query.edit_message_text(text="🗑️ Alerta eliminada de tus notificaciones.")
+            logger.info(f"Alerta {alert_id_str} eliminada para el chat {chat_id} mediante callback.")
+        else:
+            await query.edit_message_text(text="⚠️ No se pudo eliminar la alerta.")
+            logger.warning(f"No se pudo eliminar la alerta {alert_id_str} para el chat {chat_id} mediante callback.")
+        return
+        
+    if action_data.startswith("refresh_alert_"):
+        alert_id_str = action_data.replace("refresh_alert_", "")
+        await handle_refresh_alert(update, context, alert_id_str)
+        return
+
+    logger.warning(f"Callback no manejado recibido: {action_data} por usuario {chat_id}")
