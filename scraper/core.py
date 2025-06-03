@@ -302,7 +302,7 @@ async def get_html_from_url(url: str, timeout_seconds: int = config.API_TIMEOUT_
             page = await context.new_page()
 
             await page.goto(url, timeout=timeout_seconds * 1000, wait_until='domcontentloaded')
-            
+
             html_content = await page.content()
 
             if not html_content or html_content.strip() == "<html><head></head><body></body></html>":
@@ -313,6 +313,9 @@ async def get_html_from_url(url: str, timeout_seconds: int = config.API_TIMEOUT_
         logger.error(f"Timeout ({timeout_seconds}s) al obtener HTML para {url}")
         return None
     except Exception as e:
+        if "net::ERR_TOO_MANY_REDIRECTS" in str(e):
+            logger.error(f"Error de redirección excesiva para {url}: {e}", exc_info=True)
+            return None
         logger.error(f"Error general de Playwright/red al obtener HTML para {url}: {e}", exc_info=True)
         return None
     finally:
@@ -367,11 +370,9 @@ async def fetch_product_details_from_url(full_url: str) -> tuple[str | None, str
 
 async def get_product_info(url_to_scrape: str) -> dict:
     cleaned_url_str = clean_url(url_to_scrape)
-    # Intento de caché primero
     try:
         cached_product_info = await asyncio.to_thread(db_queries.get_cached_price, cleaned_url_str)
         if cached_product_info:
-            # Asegurar que los campos esperados estén presentes, incluso si vienen de caché
             final_cached_info = {
                 "price": cached_product_info.get("price"),
                 "availability": cached_product_info.get("availability", "N/A (cache)"),
@@ -387,12 +388,15 @@ async def get_product_info(url_to_scrape: str) -> dict:
                 "status": "CACHE_HIT",
                 "source": cached_product_info.get("source", "cache")
             }
-            return final_cached_info
+            if not final_cached_info["price"] or not final_cached_info["condition"]:
+                logger.warning(f"Datos incompletos en caché para {cleaned_url_str}, descartando caché.")
+            else:
+                return final_cached_info
     except Exception as e:
         logger.error(f"Error al acceder a la caché para {cleaned_url_str}: {e}", exc_info=True)
-    
+
     html_content, fetch_status = await fetch_product_details_from_url(url_to_scrape)
-    
+
     base_response = {
         "price": None, "availability": None, "condition": None,
         "name": None, "description": None, "image": None,
@@ -401,44 +405,64 @@ async def get_product_info(url_to_scrape: str) -> dict:
         "status": f"SCRAPE_FAILED_{fetch_status}",
         "source": "scrape_attempt"
     }
-    
+
     if fetch_status == 'SUCCESS' and html_content:
         try:
             product_details = _parse_product_details(html_content, url_to_scrape)
-            
             final_details = base_response.copy()
             final_details.update(product_details)
 
-            missing_attributes = [
-                key for key in ["price", "condition"]
-                if not final_details.get(key)
-            ]
+            if not final_details['price'] or not final_details['condition']:
+                logger.error(f"Datos incompletos obtenidos para {cleaned_url_str}. No se guardarán en la base de datos.")
+                final_details['status'] = f"SCRAPED_INCOMPLETE_{fetch_status}"
+                return final_details
 
-            if missing_attributes:
-                final_details["status"] = f"SCRAPED_INCOMPLETE_{fetch_status}"
-            else:
-                final_details["status"] = f"SCRAPED_SUCCESS_{fetch_status}"
-            
-            if not final_details["status"].startswith("SCRAPE_FAILED"):
-                try:
-                    await asyncio.to_thread(
-                        db_queries.save_scraped_price,
-                        cleaned_url_str,
-                        final_details
-                    )
-                except Exception as e:
-                    logger.error(f"Error al guardar datos scrapeados (éxito/incompleto) en BD para {cleaned_url_str}: {e}", exc_info=True)
-                    final_details["status"] += "_DB_SAVE_ERROR"
-            else:
-                logger.info(f"No se guardan datos para {cleaned_url_str} porque el estado es {final_details['status']}")
+            final_details['status'] = f"SCRAPED_SUCCESS_{fetch_status}"
+
+            try:
+                await asyncio.to_thread(
+                    db_queries.save_scraped_price,
+                    cleaned_url_str,
+                    final_details
+                )
+            except Exception as e:
+                logger.error(f"Error al guardar datos scrapeados en BD para {cleaned_url_str}: {e}", exc_info=True)
+                final_details["status"] += "_DB_SAVE_ERROR"
 
             return final_details
         except Exception as e:
             logger.error(f"Error al parsear HTML para {url_to_scrape} ({fetch_status}): {e}", exc_info=True)
             base_response["status"] = f"SCRAPE_FAILED_PARSE_ERROR_{fetch_status}"
-            logger.warning(f"No se guardarán datos para {cleaned_url_str} debido a error de parseo, estado: {base_response['status']}")
             return base_response
     else:
         logger.warning(f"No se guardarán datos para {cleaned_url_str} debido a fallo en obtención de HTML, estado: {base_response['status']}")
         return base_response
+
+async def get_product_info_with_retries(url_to_scrape: str) -> dict:
+    """Intenta obtener información del producto con reintentos en caso de fallos."""
+    retries = 0
+    max_retries = config.MAX_RETRIES_SCRAPER
+    delay = config.RETRY_DELAY_SCRAPER_SECONDS
+
+    while retries < max_retries:
+        product_info = await get_product_info(url_to_scrape)
+
+        if product_info.get("price") is not None and not product_info.get("status", "").startswith("SCRAPED_INCOMPLETE"):
+            return product_info
+
+        if product_info.get("status", "").startswith("SCRAPED_INCOMPLETE"):
+            logger.warning(f"Deteniendo reintentos debido a datos incompletos no recuperables para URL: {url_to_scrape}")
+            break
+
+        if "ERR_TOO_MANY_REDIRECTS" in product_info.get("status", ""):
+            logger.error(f"Deteniendo reintentos debido a redirecciones excesivas para URL: {url_to_scrape}")
+            break
+
+        retries += 1
+        logger.warning(f"Reintento {retries}/{max_retries} para URL: {url_to_scrape}. Estado actual: {product_info.get('status')}")
+
+        await asyncio.sleep(delay * retries)
+
+    logger.error(f"Fallaron todos los reintentos para URL: {url_to_scrape}")
+    return {"status": "SCRAPE_FAILED_MAX_RETRIES"}
 

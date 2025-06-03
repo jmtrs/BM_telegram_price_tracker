@@ -3,6 +3,8 @@ import logging
 from datetime import datetime, timedelta
 from .connection import get_db_connection
 import config
+import psycopg2
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -167,30 +169,51 @@ def create_alert(chat_id: int, full_url: str, clean_url: str, target_price: floa
     if not conn:
         logger.error("Failed to get DB connection in create_alert")
         raise Exception("Database connection failed") 
+
     new_alert_id = None
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO alerts (chat_id, full_url, clean_url, target_price) 
-                VALUES (%s, %s, %s, %s) RETURNING id
-            """, (chat_id, full_url, clean_url, target_price))
-            result = cur.fetchone()
-            if result:
-                new_alert_id = result['id']
+    max_retries = 3  # Número máximo de reintentos
+    retry_delay = 2  # Retraso entre reintentos en segundos
+
+    for attempt in range(max_retries):
+        try:
+            with conn.cursor() as cur:
+                # Configurar nivel de aislamiento
+                cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+
+                cur.execute(
+                    """
+                    INSERT INTO alerts (chat_id, full_url, clean_url, target_price) 
+                    VALUES (%s, %s, %s, %s) RETURNING id
+                    """,
+                    (chat_id, full_url, clean_url, target_price)
+                )
+                result = cur.fetchone()
+                if result:
+                    new_alert_id = result['id']
+                else:
+                    raise Exception("Failed to retrieve ID after insert in create_alert")
+            conn.commit()
+            if new_alert_id:
+                logger.info(f"Nueva alerta ID {new_alert_id} creada para chat_id {chat_id}, URL: {clean_url}, Objetivo: {target_price}€")
+            return new_alert_id
+        except psycopg2.OperationalError as e:
+            logger.warning(f"Intento {attempt + 1} de {max_retries} fallido en create_alert debido a bloqueo: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                continue
             else:
-                raise Exception("Failed to retrieve ID after insert in create_alert")
-        conn.commit()
-        if new_alert_id:
-            logger.info(f"Nueva alerta ID {new_alert_id} creada para chat_id {chat_id}, URL: {clean_url}, Objetivo: {target_price}€")
-        return new_alert_id
-    except Exception as e:
-        logger.error(f"Error in create_alert for chat {chat_id}, url {clean_url}: {e}")
-        if conn:
-            conn.rollback()
-        raise
-    finally:
-        if conn:
-            conn.close()
+                logger.error(f"Error en create_alert tras {max_retries} intentos: {e}")
+                if conn:
+                    conn.rollback()
+                raise
+        except Exception as e:
+            logger.error(f"Error en create_alert para chat {chat_id}, url {clean_url}: {e}")
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if conn:
+                conn.close()
 
 def get_user_alerts(chat_id: int, sort_by: str = "date_desc") -> list[dict]:
     conn = get_db_connection()
@@ -306,6 +329,9 @@ def update_alert_target_price_by_id(alert_id: str, new_target_price: float, chat
             conn.close()
 
 def update_alert_last_price(alert_id: str, current_price: float | None):
+    if current_price is None:
+        logger.warning(f"Intento de actualizar precio con None para alerta {alert_id}. Operación ignorada.")
+        return
     conn = get_db_connection()
     if not conn:
         logger.error("Failed to get DB connection in update_alert_last_price")
