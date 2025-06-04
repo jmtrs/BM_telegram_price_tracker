@@ -6,6 +6,7 @@ import re
 from bs4 import BeautifulSoup
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from prometheus_client import Counter, Histogram, Gauge
 
 import config
 from db import queries as db_queries
@@ -13,6 +14,34 @@ from .utils import clean_url
 
 logger = logging.getLogger(__name__)
 
+# Métricas de rendimiento
+scraper_success_counter = Counter('scraper_success_total', 'Número total de scrapes exitosos')
+scraper_failure_counter = Counter('scraper_failure_total', 'Número total de scrapes fallidos')
+
+# Métricas adicionales
+scraper_incomplete_counter = Counter('scraper_incomplete_total', 'Número total de scrapes con datos incompletos')
+scraper_duration_seconds = Histogram(
+    'scraper_duration_seconds',
+    'Duración en segundos de la operación de scraping completo',
+    buckets=[0.1, 0.5, 1, 2, 5, 10, 30, 60]
+)
+
+# Semáforo para limitar scrapes concurrentes
+scraper_semaphore = asyncio.Semaphore(config.SCRAPER_MAX_CONCURRENT_SCRAPES)
+
+# Pool de navegador Playwright reutilizable
+global_playwright = None
+global_browser = None
+
+# Métrica de scrapes en curso
+scraper_in_flight_gauge = Gauge('scraper_in_flight', 'Número de scrapes en curso')
+
+async def _get_browser():
+    global global_playwright, global_browser
+    if global_playwright is None or global_browser is None:
+        global_playwright = await async_playwright().start()
+        global_browser = await global_playwright.chromium.launch(headless=True)
+    return global_browser
 
 def _normalize_condition(condition_text: str | None) -> str | None:
     if not condition_text:
@@ -163,6 +192,29 @@ def _parse_product_details(html_content: str, url: str) -> dict:
         source_parts.append("name_html")
     elif product_data['name']:
         source_parts.append("name_jsonld")
+    
+    # Fallback: descripción desde meta description y imagen desde og:image si no hay JSON-LD
+    if not product_data.get('description'):
+        meta_desc = soup.find('meta', attrs={'name': 'description'})
+        if meta_desc and meta_desc.get('content'):
+            product_data['description'] = meta_desc['content'].strip()
+            source_parts.append('description_meta')
+    if not product_data.get('image'):
+        og_img = soup.find('meta', property='og:image')
+        if og_img and og_img.get('content'):
+            product_data['image'] = og_img['content'].strip()
+            source_parts.append('image_og')
+    # Fallback HTML para color y storage
+    if not product_data.get('color'):
+        color_tag = soup.find('span', class_='product-color')
+        if color_tag:
+            product_data['color'] = color_tag.get_text(strip=True)
+            source_parts.append('color_html_fallback')
+    if not product_data.get('storage'):
+        storage_tag = soup.find('span', class_='product-storage')
+        if storage_tag:
+            product_data['storage'] = storage_tag.get_text(strip=True)
+            source_parts.append('storage_html_fallback')
 
     price_from_html = None
     price_selectors = [
@@ -287,55 +339,44 @@ def _parse_product_details(html_content: str, url: str) -> dict:
     return product_data
 
 
+# Excepción personalizada para exceso de redirecciones
+class TooManyRedirectsError(Exception):
+    pass
+
 async def get_html_from_url(url: str, timeout_seconds: int = config.API_TIMEOUT_SECONDS) -> str | None:
-    logger.info(f"Iniciando scraping con Playwright para URL: {url}")
-    browser = None
-    context = None
-    page = None
-
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-            )
+    # Control de concurrencia y métrica de in-flight
+    async with scraper_semaphore:
+        scraper_in_flight_gauge.inc()
+        try:
+            logger.info(f"Iniciando scraping con Playwright para URL: {url}")
+            browser = await _get_browser()
+            # Crear un nuevo contexto y página para cada petición
+            context = await browser.new_context(user_agent=config.PLAYWRIGHT_USER_AGENT)
             page = await context.new_page()
-
-            await page.goto(url, timeout=timeout_seconds * 1000, wait_until='domcontentloaded')
-
-            html_content = await page.content()
-
-            if not html_content or html_content.strip() == "<html><head></head><body></body></html>":
-                logger.warning(f"Contenido HTML vacío o mínimo para {url}")
+            try:
+                await page.goto(url, timeout=timeout_seconds * 1000, wait_until='domcontentloaded')
+                html_content = await page.content()
+                if not html_content or html_content.strip() == "<html><head></head><body></body></html>":
+                    logger.warning(f"Contenido HTML vacío o mínimo para {url}")
+                    return None
+                return html_content
+            except PlaywrightTimeoutError:
+                logger.error(f"Timeout ({timeout_seconds}s) al obtener HTML para {url}")
                 return None
-            return html_content
-    except PlaywrightTimeoutError:
-        logger.error(f"Timeout ({timeout_seconds}s) al obtener HTML para {url}")
-        return None
-    except Exception as e:
-        if "net::ERR_TOO_MANY_REDIRECTS" in str(e):
-            logger.error(f"Error de redirección excesiva para {url}: {e}", exc_info=True)
-            return None
-        logger.error(f"Error general de Playwright/red al obtener HTML para {url}: {e}", exc_info=True)
-        return None
-    finally:
-        if page:
-            try:
+            except TooManyRedirectsError:
+                raise  # manejar en fetch
+            except Exception as e:
+                if "net::ERR_TOO_MANY_REDIRECTS" in str(e):
+                    logger.error(f"Error de redirección excesiva para {url}: {e}", exc_info=True)
+                    raise TooManyRedirectsError(e)
+                logger.error(f"Error general de Playwright/red al obtener HTML para {url}: {e}", exc_info=True)
+                return None
+            finally:
                 await page.close()
-            except Exception as e:
-                logger.warning(f"Error al cerrar página Playwright para {url}: {e}", exc_info=False)
-        if context:
-            try:
                 await context.close()
-            except Exception as e:
-                logger.warning(f"Error al cerrar contexto Playwright para {url}: {e}", exc_info=False)
-        if browser:
-            try:
-                await browser.close()
-            except Exception as e:
-                logger.warning(f"Error al cerrar navegador Playwright para {url}: {e}", exc_info=False)
-        logger.debug(f"Recursos de Playwright para {url} (intentaron ser) cerrados.")
-
+                logger.debug(f"Recursos de Playwright para {url} cerrados.")
+        finally:
+            scraper_in_flight_gauge.dec()
 
 async def fetch_product_details_from_url(full_url: str) -> tuple[str | None, str | None]:
     """
@@ -355,6 +396,10 @@ async def fetch_product_details_from_url(full_url: str) -> tuple[str | None, str
                 break 
             else: # get_html_from_url devolvió None, el error ya fue logueado allí
                 status = 'REQUEST_ERROR_NO_CONTENT' 
+        except TooManyRedirectsError as e:
+            status = 'ERR_TOO_MANY_REDIRECTS'
+            # No reintentar en caso de exceso de redirecciones
+            break
         except Exception as e: # Captura errores inesperados directamente de get_html_from_url si los hubiera
             status = 'REQUEST_EXCEPTION' # Un error más genérico si la excepción no fue manejada dentro de get_html_from_url
         
@@ -363,106 +408,124 @@ async def fetch_product_details_from_url(full_url: str) -> tuple[str | None, str
         else: # Último intento fallido
             logger.error(f"Todos los {config.MAX_RETRIES_SCRAPER + 1} intentos fallaron para {full_url}. Último estado: {status}")
             
-    if not html_content and status != 'SUCCESS':
+    if not html_content and status not in ['SUCCESS', 'ERR_TOO_MANY_REDIRECTS']:
         status = status if status != 'INIT' else 'ALL_ATTEMPTS_FAILED'
         
     return html_content, status
 
 async def get_product_info(url_to_scrape: str) -> dict:
-    cleaned_url_str = clean_url(url_to_scrape)
-    try:
-        cached_product_info = await asyncio.to_thread(db_queries.get_cached_price, cleaned_url_str)
-        if cached_product_info:
-            final_cached_info = {
-                "price": cached_product_info.get("price"),
-                "availability": cached_product_info.get("availability", "N/A (cache)"),
-                "condition": cached_product_info.get("product_condition", cached_product_info.get("condition")),
-                "name": cached_product_info.get("name", cached_product_info.get("product_name")),
-                "description": cached_product_info.get("description"),
-                "image": cached_product_info.get("image_url", cached_product_info.get("image")),
-                "color": cached_product_info.get("color"),
-                "storage": cached_product_info.get("storage"),
-                "brand_name": cached_product_info.get("brand_name"),
-                "clean_url": cleaned_url_str,
-                "full_url": url_to_scrape,
-                "status": "CACHE_HIT",
-                "source": cached_product_info.get("source", "cache")
-            }
-            if not final_cached_info["price"] or not final_cached_info["condition"]:
-                logger.warning(f"Datos incompletos en caché para {cleaned_url_str}, descartando caché.")
-            else:
-                return final_cached_info
-    except Exception as e:
-        logger.error(f"Error al acceder a la caché para {cleaned_url_str}: {e}", exc_info=True)
-
-    html_content, fetch_status = await fetch_product_details_from_url(url_to_scrape)
-
-    base_response = {
-        "price": None, "availability": None, "condition": None,
-        "name": None, "description": None, "image": None,
-        "color": None, "storage": None, "brand_name": None,
-        "clean_url": cleaned_url_str, "full_url": url_to_scrape,
-        "status": f"SCRAPE_FAILED_{fetch_status}",
-        "source": "scrape_attempt"
-    }
-
-    if fetch_status == 'SUCCESS' and html_content:
+    # Medir el tiempo total del scraping
+    with scraper_duration_seconds.time():
+        cleaned_url_str = clean_url(url_to_scrape)
         try:
-            product_details = _parse_product_details(html_content, url_to_scrape)
-            final_details = base_response.copy()
-            final_details.update(product_details)
-
-            if not final_details['price'] or not final_details['condition']:
-                logger.error(f"Datos incompletos obtenidos para {cleaned_url_str}. No se guardarán en la base de datos.")
-                final_details['status'] = f"SCRAPED_INCOMPLETE_{fetch_status}"
-                return final_details
-
-            final_details['status'] = f"SCRAPED_SUCCESS_{fetch_status}"
-
-            try:
-                await asyncio.to_thread(
-                    db_queries.save_scraped_price,
-                    cleaned_url_str,
-                    final_details
-                )
-            except Exception as e:
-                logger.error(f"Error al guardar datos scrapeados en BD para {cleaned_url_str}: {e}", exc_info=True)
-                final_details["status"] += "_DB_SAVE_ERROR"
-
-            return final_details
+            cached_product_info = await asyncio.to_thread(db_queries.get_cached_price, cleaned_url_str)
+            if cached_product_info:
+                final_cached_info = {
+                    "price": cached_product_info.get("price"),
+                    "availability": cached_product_info.get("availability", "N/A (cache)"),
+                    "condition": cached_product_info.get("product_condition", cached_product_info.get("condition")),
+                    "name": cached_product_info.get("name", cached_product_info.get("product_name")),
+                    "description": cached_product_info.get("description"),
+                    "image": cached_product_info.get("image_url", cached_product_info.get("image")),
+                    "color": cached_product_info.get("color"),
+                    "storage": cached_product_info.get("storage"),
+                    "brand_name": cached_product_info.get("brand_name"),
+                    "clean_url": cleaned_url_str,
+                    "full_url": url_to_scrape,
+                    "status": "CACHE_HIT",
+                    "source": cached_product_info.get("source", "cache")
+                }
+                if not final_cached_info["price"] or not final_cached_info["condition"]:
+                    logger.warning(f"Datos incompletos en caché para {cleaned_url_str}, descartando caché.")
+                else:
+                    scraper_success_counter.inc()
+                    return final_cached_info
         except Exception as e:
-            logger.error(f"Error al parsear HTML para {url_to_scrape} ({fetch_status}): {e}", exc_info=True)
-            base_response["status"] = f"SCRAPE_FAILED_PARSE_ERROR_{fetch_status}"
+            logger.error(f"Error al acceder a la caché para {cleaned_url_str}: {e}", exc_info=True)
+
+        html_content, fetch_status = await fetch_product_details_from_url(url_to_scrape)
+
+        base_response = {
+            "price": None, "availability": None, "condition": None,
+            "name": None, "description": None, "image": None,
+            "color": None, "storage": None, "brand_name": None,
+            "clean_url": cleaned_url_str, "full_url": url_to_scrape,
+            "status": f"SCRAPE_FAILED_{fetch_status}",
+            "source": "scrape_attempt"
+        }
+
+        if fetch_status == 'SUCCESS' and html_content:
+            try:
+                product_details = _parse_product_details(html_content, url_to_scrape)
+                final_details = base_response.copy()
+                final_details.update(product_details)
+
+                if not final_details['price'] or not final_details['condition']:
+                    logger.error(f"Datos incompletos obtenidos para {cleaned_url_str}. No se guardarán en la base de datos.")
+                    final_details['status'] = f"SCRAPED_INCOMPLETE_{fetch_status}"
+                    scraper_incomplete_counter.inc()
+                    return final_details
+
+                final_details['status'] = f"SCRAPED_SUCCESS_{fetch_status}"
+
+                try:
+                    await asyncio.to_thread(
+                        db_queries.save_scraped_price,
+                        cleaned_url_str,
+                        final_details
+                    )
+                except Exception as e:
+                    logger.error(f"Error al guardar datos scrapeados en BD para {cleaned_url_str}: {e}", exc_info=True)
+                    final_details["status"] += "_DB_SAVE_ERROR"
+
+                scraper_success_counter.inc()
+                return final_details
+            except Exception as e:
+                logger.error(f"Error al parsear HTML para {url_to_scrape} ({fetch_status}): {e}", exc_info=True)
+                base_response["status"] = f"SCRAPE_FAILED_PARSE_ERROR_{fetch_status}"
+                scraper_failure_counter.inc()
+                return base_response
+        else:
+            logger.warning(f"No se guardarán datos para {cleaned_url_str} debido a fallo en obtención de HTML, estado: {base_response['status']}")
+            scraper_failure_counter.inc()
             return base_response
-    else:
-        logger.warning(f"No se guardarán datos para {cleaned_url_str} debido a fallo en obtención de HTML, estado: {base_response['status']}")
-        return base_response
 
 async def get_product_info_with_retries(url_to_scrape: str) -> dict:
     """Intenta obtener información del producto con reintentos en caso de fallos."""
     retries = 0
     max_retries = config.MAX_RETRIES_SCRAPER
     delay = config.RETRY_DELAY_SCRAPER_SECONDS
+    last_status = None
 
     while retries < max_retries:
         product_info = await get_product_info(url_to_scrape)
+        last_status = product_info.get("status")
 
-        if product_info.get("price") is not None and not product_info.get("status", "").startswith("SCRAPED_INCOMPLETE"):
+        if product_info.get("price") is not None and not last_status.startswith("SCRAPED_INCOMPLETE"):
             return product_info
 
-        if product_info.get("status", "").startswith("SCRAPED_INCOMPLETE"):
-            logger.warning(f"Deteniendo reintentos debido a datos incompletos no recuperables para URL: {url_to_scrape}")
-            break
-
-        if "ERR_TOO_MANY_REDIRECTS" in product_info.get("status", ""):
-            logger.error(f"Deteniendo reintentos debido a redirecciones excesivas para URL: {url_to_scrape}")
-            break
+        if last_status.startswith("SCRAPED_INCOMPLETE") or "ERR_TOO_MANY_REDIRECTS" in last_status:
+            logger.warning(f"No se reintenta para URL {url_to_scrape}, estado no recuperable: {last_status}")
+            return product_info
 
         retries += 1
-        logger.warning(f"Reintento {retries}/{max_retries} para URL: {url_to_scrape}. Estado actual: {product_info.get('status')}")
-
+        logger.warning(f"Reintento {retries}/{max_retries} para URL: {url_to_scrape}. Estado actual: {last_status}")
         await asyncio.sleep(delay * retries)
 
-    logger.error(f"Fallaron todos los reintentos para URL: {url_to_scrape}")
-    return {"status": "SCRAPE_FAILED_MAX_RETRIES"}
+    logger.error(f"Fallaron todos los reintentos para URL: {url_to_scrape}, estado final: {last_status}")
+    return {"status": last_status or "SCRAPE_FAILED_MAX_RETRIES"}
+
+async def shutdown_playwright():
+    """Cierra el navegador y detiene Playwright."""
+    global global_browser, global_playwright
+    try:
+        if global_browser:
+            await global_browser.close()
+    except Exception:
+        pass
+    try:
+        if global_playwright:
+            await global_playwright.stop()
+    except Exception:
+        pass
 

@@ -6,3 +6,4 @@ python-dotenv
 nest_asyncio
 pytest
 pytest-asyncio
+prometheus_client

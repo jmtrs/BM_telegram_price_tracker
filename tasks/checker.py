@@ -3,6 +3,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 import math
+import urllib.parse
 
 from telegram.ext import Application
 from telegram.constants import ParseMode
@@ -10,16 +11,21 @@ from telegram.error import TelegramError
 
 import config
 from db import queries as db_queries
+from db.queries import get_active_host_circuits, set_host_circuit_break, cleanup_expired_host_circuits
 from scraper import core as scraper_core
 from bot import ui as bot_ui
+from scraper.core import scraper_semaphore
 
 logger = logging.getLogger(__name__)
 
-async def check_alerts_periodically(application: Application):
+async def check_alerts_periodically(application: Application, shutdown_event: asyncio.Event):
     bot = application.bot
     retry_attempt = 0  # Contador para intentos de reintento
+    # Inicializar y limpiar estado de circuit breaker desde BD
+    await asyncio.to_thread(cleanup_expired_host_circuits)
+    host_failures = await asyncio.to_thread(get_active_host_circuits)
 
-    while True:
+    while not shutdown_event.is_set():
         logger.info(f"[Checker] Ejecutando ciclo a las {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         try:
             alerts_to_check = await asyncio.to_thread(db_queries.get_all_alerts)
@@ -51,11 +57,32 @@ async def check_alerts_periodically(application: Application):
                     logger.info(f"Saltando alerta ID {alert_data['id']} (cooldown).")
                     continue
 
-                product_info = await scraper_core.get_product_info_with_retries(alert_data['full_url'])
+                # Limitar concurrencia global de scraping
+                async with scraper_semaphore:
+                    try:
+                        # Aplicar timeout global para scraping
+                        product_info = await asyncio.wait_for(
+                            scraper_core.get_product_info_with_retries(alert_data['full_url']),
+                            timeout=config.SCRAPE_TTL_MINUTES * 60
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"[Checker] Timeout al scrapear {alert_data['full_url']} (> {config.SCRAPE_TTL_MINUTES} minutos).")
+                        continue
+
+                host = urllib.parse.urlparse(alert_data['full_url']).netloc
+                if host in host_failures and datetime.utcnow() < host_failures[host]:
+                    logger.warning(f"Circuit breaker activo para host {host}, saltando.")
+                    continue
+
                 current_price = product_info.get("price")
 
-                if current_price is None or product_info.get("status", "").startswith("SCRAPED_INCOMPLETE"):
+                if current_price is None or product_info.get("status", "").startswith("SCRAPED_INCOMPLETE") or "ERR_TOO_MANY_REDIRECTS" in product_info.get("status", ""):
                     logger.warning(f"No se pudo obtener precio o datos incompletos para alerta ID {alert_data['id']}. Estado: {product_info.get('status')}")
+                    if "ERR_TOO_MANY_REDIRECTS" in product_info.get("status", ""):
+                        # Registrar circuit breaker en BD
+                        until_ts = datetime.utcnow() + timedelta(hours=config.CIRCUIT_BREAKER_HOURS)
+                        await asyncio.to_thread(set_host_circuit_break, host, until_ts)
+                        host_failures[host] = until_ts
                     continue
 
                 previous_last_price = alert_data.get('last_price')
@@ -119,5 +146,12 @@ async def check_alerts_periodically(application: Application):
         except Exception as e:
             logger.error(f"[Checker] Error durante limpieza de caché: {e}", exc_info=True)
 
-        logger.info(f"[Checker] Ciclo completado. Durmiendo por {config.CHECK_INTERVAL_SECONDS}s.")
-        await asyncio.sleep(config.CHECK_INTERVAL_SECONDS)
+        logger.info(f"[Checker] Ciclo completado. Esperando {config.CHECK_INTERVAL_SECONDS}s o hasta shutdown.")
+        # Espera interrumpible por shutdown_event
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=config.CHECK_INTERVAL_SECONDS)
+            logger.info("[Checker] Shutdown signal recibido, finalizando checker.")
+            break
+        except asyncio.TimeoutError:
+            # Timeout expirado, continuar próximo ciclo
+            continue

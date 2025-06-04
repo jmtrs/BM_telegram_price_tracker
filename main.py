@@ -6,8 +6,11 @@ import asyncio
 import logging
 
 import config
+from scraper.core import shutdown_playwright  # Para cerrar recursos Playwright en shutdown
+from asyncio import Event as _ShutdownEvent  # Evento para señalizar parada al checker
 
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler
+from prometheus_client import start_http_server
 
 # Importar módulos como paquetes desde la raíz del proyecto
 from bot import handlers as bot_handlers
@@ -23,6 +26,9 @@ logging.getLogger("httpx").setLevel(config.LOGGING_HTTPX_LEVEL)
 logging.getLogger("telegram.ext").setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
+
+# Inicia el servidor de métricas en el puerto 8080
+start_http_server(8080)
 
 
 async def main_async_logic():
@@ -51,9 +57,12 @@ async def main_async_logic():
     application.add_handler(CommandHandler("delete", bot_handlers.delete_alert_by_number_command))
     application.add_handler(CallbackQueryHandler(bot_handlers.callback_query_handler))
 
-    # Crear y programar la tarea del checker
+    # Crear evento de parada y programar la tarea del checker
+    shutdown_event = _ShutdownEvent()
     # Esta tarea se ejecutará en el mismo bucle de eventos que application.run_polling()
-    checker_task = asyncio.create_task(tasks_checker.check_alerts_periodically(application))
+    checker_task = asyncio.create_task(
+        tasks_checker.check_alerts_periodically(application, shutdown_event)
+    )
     logger.info("Tarea del checker programada.")
 
     try:
@@ -67,6 +76,9 @@ async def main_async_logic():
     finally:
         logger.info("Iniciando proceso de apagado (desde el bloque finally de main_async_logic)...")
 
+        # Señalizar al checker que debe interrumpir sleeps y finalizar lo antes posible
+        shutdown_event.set()
+
         if checker_task and not checker_task.done():
             logger.info("Cancelando la tarea del checker...")
             checker_task.cancel()
@@ -78,7 +90,17 @@ async def main_async_logic():
             except Exception as e_task:
                 logger.error(f"Error durante la espera de la cancelación de la tarea del checker: {e_task}", exc_info=True)
 
+        # Cerrar conexión a BD
         db_connection.close_db_connection()
+        logger.info("Conexión a la BD cerrada.")
+
+        # Cerrar recursos de Playwright para evitar procesos huérfanos
+        try:
+            await shutdown_playwright()
+            logger.info("Playwright cerrado correctamente.")
+        except Exception as e:
+            logger.error(f"Error al cerrar Playwright: {e}")
+
         logger.info("🤖 Bot detenido (desde el bloque finally de main_async_logic).")
 
 

@@ -367,3 +367,25 @@ def update_alert_last_notified(alert_id: str):
     finally:
         if conn:
             conn.close()
+
+# --- Circuit Breaker / Host Failures Queries ---
+
+# Implementación en memoria
+host_failures_state: dict[str, datetime] = {}
+
+def set_host_circuit_break(host: str, until_ts: datetime):
+    """Guarda o actualiza el estado del circuito rompedor para un host en memoria."""
+    host_failures_state[host] = until_ts
+
+def get_active_host_circuits() -> dict:
+    """Obtiene los hosts con circuito rompedor activo (hasta until_ts > ahora)."""
+    now = datetime.utcnow()
+    return {host: until_ts for host, until_ts in host_failures_state.items() if until_ts > now}
+
+def cleanup_expired_host_circuits() -> int:
+    """Elimina hosts expirados del circuito rompedor y retorna cantidad eliminada."""
+    now = datetime.utcnow()
+    expired = [host for host, until_ts in host_failures_state.items() if until_ts <= now]
+    for host in expired:
+        del host_failures_state[host]
+    return len(expired)
