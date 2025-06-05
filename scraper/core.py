@@ -3,7 +3,9 @@ import logging
 import json
 import asyncio
 import re
+import time
 from bs4 import BeautifulSoup
+import urllib.parse
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from prometheus_client import Counter, Histogram, Gauge
@@ -35,6 +37,13 @@ global_browser = None
 
 # Métrica de scrapes en curso
 scraper_in_flight_gauge = Gauge('scraper_in_flight', 'Número de scrapes en curso')
+
+# Métrica de scrapes perdidos y latencia de espera de semáforo
+stale_products_counter = Counter('scrapes_perdidos_total', 'Número total de scrapes perdidos por semáforo saturado')
+semaphore_wait_seconds = Histogram('semaphore_wait_seconds', 'Tiempo en segundos esperando semáforo', buckets=[0.1, 0.5, 1, 2, 5, 10])
+
+# Diccionario de semáforos por host
+host_semaphores: dict[str, asyncio.Semaphore] = {}
 
 async def _get_browser():
     global global_playwright, global_browser
@@ -344,39 +353,79 @@ class TooManyRedirectsError(Exception):
     pass
 
 async def get_html_from_url(url: str, timeout_seconds: int = config.API_TIMEOUT_SECONDS) -> str | None:
-    # Control de concurrencia y métrica de in-flight
-    async with scraper_semaphore:
-        scraper_in_flight_gauge.inc()
+    # Semáforo por host
+    host = urllib.parse.urlparse(url).netloc
+    host_sem = host_semaphores.setdefault(host, asyncio.Semaphore(config.SCRAPER_MAX_CONCURRENT_SCRAPES_PER_HOST))
+    # Intentar adquirir semáforo de host con timeout y medir latencia
+    start_host_wait = time.monotonic()
+    try:
+        await asyncio.wait_for(host_sem.acquire(), timeout=config.SEMAPHORE_ACQUIRE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        stale_products_counter.inc()
+        logger.warning(f"Semáforo por host ocupado >{config.SEMAPHORE_ACQUIRE_TIMEOUT_SECONDS}s para {host}, scrape perdido para {url}")
+        return None
+    host_wait_elapsed = time.monotonic() - start_host_wait
+    semaphore_wait_seconds.observe(host_wait_elapsed)
+
+    # Semáforo global
+    start_global_wait = time.monotonic()
+    try:
+        await asyncio.wait_for(scraper_semaphore.acquire(), timeout=config.SEMAPHORE_ACQUIRE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        stale_products_counter.inc()
+        # Liberar semáforo de host si falla acquire global
+        host_sem.release()
+        logger.warning(f"Semáforo global ocupado >{config.SEMAPHORE_ACQUIRE_TIMEOUT_SECONDS}s, scrape perdido para {url}")
+        return None
+    global_wait_elapsed = time.monotonic() - start_global_wait
+    semaphore_wait_seconds.observe(global_wait_elapsed)
+    # Ya adquiridos ambos semáforos, iniciar scraping
+    scraper_in_flight_gauge.inc()
+    try:
+        logger.info(f"Iniciando scraping con Playwright para URL: {url}")
+        browser = await _get_browser()
+        # Crear un nuevo contexto y página para cada petición
+        context = await browser.new_context(user_agent=config.PLAYWRIGHT_USER_AGENT)
+        page = await context.new_page()
         try:
-            logger.info(f"Iniciando scraping con Playwright para URL: {url}")
-            browser = await _get_browser()
-            # Crear un nuevo contexto y página para cada petición
-            context = await browser.new_context(user_agent=config.PLAYWRIGHT_USER_AGENT)
-            page = await context.new_page()
-            try:
-                await page.goto(url, timeout=timeout_seconds * 1000, wait_until='domcontentloaded')
-                html_content = await page.content()
-                if not html_content or html_content.strip() == "<html><head></head><body></body></html>":
-                    logger.warning(f"Contenido HTML vacío o mínimo para {url}")
+            # Intento original con query y fragmentos
+            await page.goto(url, timeout=timeout_seconds * 1000, wait_until='domcontentloaded')
+            html_content = await page.content()
+            if not html_content or html_content.strip() == "<html><head></head><body></body></html>":
+                logger.warning(f"Contenido HTML vacío o mínimo para {url}")
+                return None
+            return html_content
+        except PlaywrightTimeoutError:
+            logger.error(f"Timeout ({timeout_seconds}s) al obtener HTML para {url}")
+            return None
+        except Exception as e:
+            # Manejo de demasiadas redirecciones: strip query y fragment y reintentar
+            msg = str(e)
+            if "net::ERR_TOO_MANY_REDIRECTS" in msg:
+                logger.warning(f"Exceso de redirecciones para {url}, reintentando sin parámetros...")
+                parsed = urllib.parse.urlparse(url)
+                stripped = urllib.parse.urlunparse(parsed._replace(query='', fragment=''))
+                try:
+                    await page.goto(stripped, timeout=timeout_seconds * 1000, wait_until='domcontentloaded')
+                    html_content = await page.content()
+                    if not html_content or html_content.strip() == "<html><head></head><body></body></html>":
+                        logger.warning(f"Contenido HTML vacío tras reintento para {stripped}")
+                        return None
+                    return html_content
+                except Exception as e2:
+                    logger.error(f"Reintento fallido para {stripped}: {e2}")
                     return None
-                return html_content
-            except PlaywrightTimeoutError:
-                logger.error(f"Timeout ({timeout_seconds}s) al obtener HTML para {url}")
-                return None
-            except TooManyRedirectsError:
-                raise  # manejar en fetch
-            except Exception as e:
-                if "net::ERR_TOO_MANY_REDIRECTS" in str(e):
-                    logger.error(f"Error de redirección excesiva para {url}: {e}", exc_info=True)
-                    raise TooManyRedirectsError(e)
-                logger.error(f"Error general de Playwright/red al obtener HTML para {url}: {e}", exc_info=True)
-                return None
-            finally:
-                await page.close()
-                await context.close()
-                logger.debug(f"Recursos de Playwright para {url} cerrados.")
+            logger.error(f"Error general de Playwright/red al obtener HTML para {url}: {e}", exc_info=True)
+            return None
         finally:
-            scraper_in_flight_gauge.dec()
+            await page.close()
+            await context.close()
+            logger.debug(f"Recursos de Playwright para {url} cerrados.")
+    finally:
+        scraper_in_flight_gauge.dec()
+        # Liberar semáforos en orden inverso
+        scraper_semaphore.release()
+        host_sem.release()
 
 async def fetch_product_details_from_url(full_url: str) -> tuple[str | None, str | None]:
     """

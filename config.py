@@ -18,6 +18,18 @@ API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", 20))
 # Número máximo de scrapes concurrentes permitidos
 SCRAPER_MAX_CONCURRENT_SCRAPES = int(os.getenv("SCRAPER_MAX_CONCURRENT_SCRAPES", 5))
 
+# Concurrencia máxima de scrapes por host
+try:
+    SCRAPER_MAX_CONCURRENT_SCRAPES_PER_HOST = int(os.getenv("SCRAPER_MAX_CONCURRENT_SCRAPES_PER_HOST", 2))
+except ValueError:
+    SCRAPER_MAX_CONCURRENT_SCRAPES_PER_HOST = 2  # Valor por defecto segura
+
+# Añadir timeout para adquisición de semáforo
+SEMAPHORE_ACQUIRE_TIMEOUT_SECONDS = float(os.getenv("SEMAPHORE_ACQUIRE_TIMEOUT_SECONDS", 10))  # Tiempo máximo en segundos para esperar semáforo
+
+# Jitter máximo entre batches en segundos
+JITTER_MAX_SECONDS = float(os.getenv("JITTER_MAX_SECONDS", 0.5))
+
 LOGGING_LEVEL_NAME = os.getenv("LOGGING_LEVEL", "INFO").upper()
 LOGGING_HTTPX_LEVEL_NAME = os.getenv("LOGGING_HTTPX_LEVEL", "WARNING").upper()
 
