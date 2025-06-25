@@ -30,6 +30,9 @@ SEMAPHORE_ACQUIRE_TIMEOUT_SECONDS = float(os.getenv("SEMAPHORE_ACQUIRE_TIMEOUT_S
 # Jitter máximo entre batches en segundos
 JITTER_MAX_SECONDS = float(os.getenv("JITTER_MAX_SECONDS", 0.5))
 
+# Límite por defecto de peticiones de recomendaciones a mostrar en el bot
+RECOMMENDATIONS_DEFAULT_LIMIT = int(os.getenv("RECOMMENDATIONS_DEFAULT_LIMIT", 10))
+
 LOGGING_LEVEL_NAME = os.getenv("LOGGING_LEVEL", "INFO").upper()
 LOGGING_HTTPX_LEVEL_NAME = os.getenv("LOGGING_HTTPX_LEVEL", "WARNING").upper()
 
@@ -56,3 +59,12 @@ PLAYWRIGHT_USER_AGENT = os.getenv(
 
 # Tiempo en horas para reintentar un host tras demasiadas redirecciones
 CIRCUIT_BREAKER_HOURS = float(os.getenv("CIRCUIT_BREAKER_HOURS", 1))
+
+# URLs y categorías para recomendaciones
+RECOMMENDATION_URLS = {
+    'good-deals': 'https://www.backmarket.es/es-es/e/good-deals',
+    'smartphones': 'https://www.backmarket.es/es-es/l/smartphoness/6c290010-c0c2-47a4-b68a-ac2ec2b64dca',
+    'portatil': 'https://www.backmarket.es/es-es/l/portatil/630dab14-5051-49b9-bc7b-bb20876d4850',
+    'tablets-reacondicionadas': 'https://www.backmarket.es/es-es/l/tablets-reacondicionadas/5a3cfa21-b588-49b1-b4e9-2636bec68ada',
+    'accessories': 'https://www.backmarket.es/es-es/e/accessories'
+}

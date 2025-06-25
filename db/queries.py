@@ -389,3 +389,46 @@ def cleanup_expired_host_circuits() -> int:
     for host in expired:
         del host_failures_state[host]
     return len(expired)
+
+def get_recent_recommendation_requests(limit: int = 10) -> list[dict]:
+    """Devuelve las últimas `limit` peticiones de recomendaciones."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, recommendation_request_id, widget_id, requested_at
+                FROM public.recommendation_requests
+                ORDER BY requested_at DESC
+                LIMIT %s
+                """,
+                (limit,)
+            )
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"Error en get_recent_recommendation_requests: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def get_recommended_products_by_request(request_id: str) -> list[dict]:
+    """Devuelve todos los productos asociados a una petición de recomendación."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT product_id, listing_id, title, name, price_amount, price_currency, raw_data
+                FROM public.recommended_products
+                WHERE request_id = %s
+                ORDER BY id
+                """,
+                (request_id,)
+            )
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"Error en get_recommended_products_by_request: {e}")
+        return []
+    finally:
+        conn.close()

@@ -142,10 +142,59 @@ def format_notification_content(alert_data: dict, product_info: dict) -> tuple[s
     return full_message_text, inline_keyboard, image_url_to_send
 
 
+def format_recommendations_message(requests: list[dict], products_map: dict[str, list[dict]]) -> str:
+    """
+    Formatea un mensaje con las últimas peticiones de recomendaciones y sus productos.
+    """
+    if not requests:
+        return "📭 No hay recomendaciones disponibles."
+
+    lines = ["📣 *Recomendaciones recientes*\n"]
+    for req in requests:
+        req_id = req.get('recommendation_request_id')
+        widget_id = req.get('widget_id')
+        timestamp = req.get('requested_at')
+        # Cabecera de cada lote
+        lines.append(f"🔔 *{req_id}* (widget: {widget_id}) — {timestamp}")
+        # Categoría legible (opcional)
+        # lines.append(f"🗂 Categoría: {widget_id}")
+        prods = products_map.get(str(req.get('id')), [])
+        for p in prods:
+            raw = p.get('raw_data', {})
+            # Preferir nombre completo y enlace clicable
+            name = raw.get('name') or raw.get('displayTitle') or p.get('title') or 'Sin título'
+            link = raw.get('link', {}).get('href')
+            if link:
+                title_md = f"[{name}]({link})"
+            else:
+                title_md = name
+            amount = p.get('price_amount')
+            currency = p.get('price_currency') or ''
+            # Línea principal con precio
+            lines.append(f"  • {title_md} — {amount}{currency}")
+            # Detalles adicionales cuando existan
+            extras = []
+            if raw.get('brand'):
+                extras.append(raw['brand'])
+            grade = raw.get('listing', {}).get('grade', {}).get('name')
+            if grade:
+                extras.append(grade)
+            rating = raw.get('reviewRating', {}).get('average')
+            if rating:
+                extras.append(f"⭐{rating}")
+            ref_price = raw.get('referencePrice', {}).get('amount')
+            if ref_price:
+                extras.append(f"ref: {ref_price}{currency}")
+            if extras:
+                lines.append(f"     ({' • '.join(extras)})")
+        lines.append("")
+    return "\n".join(lines)
+
 HELP_MESSAGE_MARKDOWN = (
     "🤖 *Comandos disponibles:*\n\n"
     "/track `<URL>` `<precio_objetivo>` – Añade o actualiza una alerta.\n"
     "/alerts – Lista tus alertas y permite eliminarlas.\n"
     "/delete `<número>` – Elimina una alerta por su número de la lista.\n"
+    "/recommendations `<n>` – Muestra las últimas n recomendaciones (por defecto 10).\n"
     "/help – Muestra este mensaje."
 )

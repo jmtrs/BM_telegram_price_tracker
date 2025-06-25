@@ -10,6 +10,7 @@ from scraper.core import shutdown_playwright  # Para cerrar recursos Playwright 
 from asyncio import Event as _ShutdownEvent  # Evento para señalizar parada al checker
 
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler
+from tasks.fetch_recommendations import fetch_recommendations_periodically
 from prometheus_client import start_http_server
 
 # Importar módulos como paquetes desde la raíz del proyecto
@@ -56,6 +57,7 @@ async def main_async_logic():
     application.add_handler(CommandHandler("alerts", bot_handlers.list_alerts_command))
     application.add_handler(CommandHandler("delete", bot_handlers.delete_alert_by_number_command))
     application.add_handler(CallbackQueryHandler(bot_handlers.callback_query_handler))
+    application.add_handler(CommandHandler("recommendations", bot_handlers.recommendations_command))
 
     # Crear evento de parada y programar la tarea del checker
     shutdown_event = _ShutdownEvent()
@@ -63,7 +65,11 @@ async def main_async_logic():
     checker_task = asyncio.create_task(
         tasks_checker.check_alerts_periodically(application, shutdown_event)
     )
+    fetch_task = asyncio.create_task(
+        fetch_recommendations_periodically(shutdown_event)
+    )
     logger.info("Tarea del checker programada.")
+    logger.info("Tarea de fetch_recommendations programada.")
 
     try:
         logger.info("🤖 Bot iniciado y escuchando actualizaciones...")
@@ -82,13 +88,21 @@ async def main_async_logic():
         if checker_task and not checker_task.done():
             logger.info("Cancelando la tarea del checker...")
             checker_task.cancel()
-            try:
-                await checker_task
-                logger.info("Tarea del checker finalizada después de la cancelación.")
-            except asyncio.CancelledError:
-                logger.info("Tarea del checker explícitamente cancelada y finalizada.")
-            except Exception as e_task:
-                logger.error(f"Error durante la espera de la cancelación de la tarea del checker: {e_task}", exc_info=True)
+        if fetch_task and not fetch_task.done():
+            logger.info("Cancelando la tarea de fetch_recommendations...")
+            fetch_task.cancel()
+        try:
+            await checker_task
+            logger.info("Tarea del checker finalizada después de la cancelación.")
+        except asyncio.CancelledError:
+            logger.info("Tarea del checker explícitamente cancelada y finalizada.")
+        try:
+            await fetch_task
+            logger.info("Tarea de fetch_recommendations finalizada después de la cancelación.")
+        except asyncio.CancelledError:
+            logger.info("Tarea de fetch_recommendations cancelada exitosamente.")
+        except Exception as e_task:
+            logger.error(f"Error durante la espera de la cancelación de la tarea del checker: {e_task}", exc_info=True)
 
         # Cerrar conexión a BD
         db_connection.close_db_connection()

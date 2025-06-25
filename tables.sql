@@ -31,3 +31,30 @@ CREATE TABLE public.alerts (
 );
 CREATE UNIQUE INDEX alerts_chat_id_clean_url_idx ON public.alerts USING btree (chat_id, clean_url);
 CREATE INDEX alerts_chat_id_idx ON public.alerts USING btree (chat_id);
+
+-- public.recommendation_requests: histórico de llamadas al endpoint de recomendaciones
+CREATE TABLE public.recommendation_requests (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    recommendation_request_id text NOT NULL,
+    widget_id text NOT NULL,
+    requested_at timestamp DEFAULT now() NOT NULL,
+    response jsonb NOT NULL,
+    CONSTRAINT recommendation_requests_pkey PRIMARY KEY (id),
+    CONSTRAINT recommendation_requests_request_id_key UNIQUE (recommendation_request_id)
+);
+CREATE INDEX recommendation_requests_widget_idx ON public.recommendation_requests USING btree (widget_id);
+
+-- public.recommended_products: productos devueltos en cada petición de recomendación
+CREATE TABLE public.recommended_products (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    request_id uuid NOT NULL REFERENCES public.recommendation_requests(id) ON DELETE CASCADE,
+    product_id text NOT NULL,
+    listing_id text,
+    title text,
+    name text,
+    price_amount float8,
+    price_currency text,
+    raw_data jsonb NOT NULL,
+    CONSTRAINT recommended_products_pkey PRIMARY KEY (id)
+);
+CREATE INDEX recommended_products_request_idx ON public.recommended_products USING btree (request_id);

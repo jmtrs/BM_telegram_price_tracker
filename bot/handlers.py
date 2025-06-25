@@ -8,12 +8,15 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from uuid import UUID
 
+import config
+
 from db import queries as db_queries
 from scraper import core as scraper_core
 from scraper import utils as scraper_utils
 from .ui import (
     format_product_info_message,
     format_alert_list_message,
+    format_recommendations_message,
     HELP_MESSAGE_MARKDOWN
 )
 
@@ -379,3 +382,21 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     logger.warning(f"Callback no manejado recibido: {action_data} por usuario {chat_id}")
+
+async def recommendations_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra las últimas peticiones de recomendaciones y sus productos."""
+    chat_id = update.effective_chat.id
+    # Leer cantidad opcional de peticiones a mostrar (defecto desde config)
+    limit = config.RECOMMENDATIONS_DEFAULT_LIMIT
+    if context.args and context.args[0].isdigit():
+        limit = int(context.args[0])
+    # Obtener peticiones y productos
+    requests = await asyncio.to_thread(db_queries.get_recent_recommendation_requests, limit)
+    products_map = {}
+    for req in requests:
+        rid = str(req['id'])
+        prods = await asyncio.to_thread(db_queries.get_recommended_products_by_request, rid)
+        products_map[rid] = prods
+    # Formatear mensaje
+    message = format_recommendations_message(requests, products_map)
+    await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
